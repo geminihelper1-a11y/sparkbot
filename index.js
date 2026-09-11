@@ -18,6 +18,11 @@ const {
 const fs = require('fs');
 require('dotenv').config();
 
+const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
+const GROQ_MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-20b';
+const GROQ_STRONG_MODEL = process.env.GROQ_STRONG_MODEL || 'openai/gpt-oss-120b';
+const AI_ENABLED = Boolean(GROQ_API_KEY);
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -32,6 +37,9 @@ const client = new Client({
 const DATA_FILE = './data.json';
 const tempVCs = new Set();
 const userSelectedChannels = new Map();
+const mcPanelFingerprint = new Map();
+const aiCooldowns = new Map();
+const securityBurst = new Map();
 
 // NETHRION SMP defaults; `sp smp-set` overrides them per guild.
 const DEFAULT_SMP = {
@@ -160,7 +168,8 @@ async function fetchFullStatus(javaHost, javaPort, bedrockHost, bedrockPort) {
     motd: cleanMotd(java?.motd?.clean || bedrock?.motd?.clean || '') || 'NETHRION SMP',
     playerList,
     javaIp: javaPort === 25565 ? javaHost : `${javaHost}:${javaPort}`,
-    bedrockIp: `${bedrockHost}:${bedrockPort}`,
+    javaPort,
+    bedrockIp: bedrockHost,
     bedrockPort,
     retrievedAt: java?.retrieved_at || bedrock?.retrieved_at || Date.now()
   };
@@ -186,19 +195,29 @@ function buildSimpleMCEmbed(ip, data) {
 }
 
 function buildPanelEmbed(data) {
-  const names = (data.playerList || []).slice(0, 10);
-  return new EmbedBuilder()
+  const names = (data.playerList || []).slice(0, 20);
+  const playersValue = names.length
+    ? names.join(' · ').slice(0, 1024)
+    : (data.isOnline ? 'The Server is Waiting for You, Come Fast.' : 'The Server is currently offline.');
+  const embed = new EmbedBuilder()
     .setTitle('⛏️ NETHRION SMP')
     .setColor(data.isOnline ? '#2ecc71' : '#e74c3c')
-    .setDescription(`${data.isOnline ? '🟢 **Online**' : '🔴 **Offline**'}  ·  ${data.playersOnline} players`)
+    .setDescription(`${data.isOnline ? '🟢 **Online**' : '🔴 **Offline**'} · ${data.playersOnline === '—' ? '—' : data.playersOnline + ' players'}`)
     .addFields(
-      { name: 'Java', value: `\`${data.javaIp}\`  ${data.javaOnline ? '🟢' : '🔴'}`, inline: true },
-      { name: 'Bedrock', value: `\`${data.bedrockIp}\`  ${data.bedrockOnline ? '🟢' : '🔴'}`, inline: true },
-      { name: 'Version', value: `\`${trimField(data.version, 80)}\``, inline: true },
-      { name: 'Online Now', value: names.length ? trimField(names.join(', '), 900) : 'No player names exposed by the server.', inline: false }
+      { name: '👥 Players', value: playersValue, inline: false },
+      {
+        name: '📌 Server Details',
+        value: [
+          `🌐 **Java IP:** \`${data.javaIp.split(':')[0]}\``,
+          `🪨 **Bedrock IP:** \`${data.bedrockIp}\``,
+          `📱 **Bedrock Port:** \`${data.bedrockPort}\``,
+          `💻 **Java Port:** ${data.javaPort === 25565 ? 'Default (\`25565\`)' : `\`${data.javaPort}\``}`
+        ].join('\n'),
+        inline: false
+      }
     )
-    .setFooter({ text: 'Player names are only shown when exposed by the server • updates every 60s' })
     .setTimestamp();
+  return embed;
 }
 
 async function updateMCPanel() {
@@ -211,7 +230,15 @@ async function updateMCPanel() {
     if (!message) return;
     const cfg = db.smpConfig || { ...DEFAULT_SMP };
     const data = await fetchFullStatus(cfg.javaHost, cfg.javaPort, cfg.bedrockHost, cfg.bedrockPort);
+    const fingerprint = JSON.stringify({
+      online: data.isOnline, javaOnline: data.javaOnline, bedrockOnline: data.bedrockOnline,
+      playersOnline: data.playersOnline, names: data.playerList || [], version: data.version,
+      javaIp: data.javaIp, javaPort: data.javaPort, bedrockIp: data.bedrockIp, bedrockPort: data.bedrockPort
+    });
+    const key = `${db.mcPanel.channelId}:${db.mcPanel.messageId}`;
+    if (mcPanelFingerprint.get(key) === fingerprint) return;
     await message.edit({ embeds: [buildPanelEmbed(data)] });
+    mcPanelFingerprint.set(key, fingerprint);
   } catch (err) {
     console.error('[MC Panel Error]:', err.message);
   }
@@ -256,9 +283,8 @@ client.once(Events.ClientReady, () => {
   console.log(`🔥 Spark Bot is ONLINE as ${client.user.tag}`);
   console.log(`=================================\n`);
 
-  // 30s is the safe floor: fast enough to feel "live", but won't risk Discord's
-  // message-edit rate limit or hammer the Minecraft server with pings.
-  setInterval(updateMCPanel, 60 * 1000);
+  // Poll every 15s; update Discord only when the actual SMP state changed.
+  setInterval(updateMCPanel, 15 * 1000);
   setTimeout(updateMCPanel, 3000);
   setInterval(checkYouTubeUploads, 5 * 60 * 1000);
   setInterval(() => {
@@ -475,7 +501,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     await targetChannel.send({ content: cleanMsg });
 
     const modLogChannel = interaction.guild.channels.cache.find(
-      c => (c.name.includes('mod-logs') || c.name.includes('anon-logs')) && c.isTextBased()
+      c => (c.name.includes('mod-logs') || c.name.includes('anon-logs') || normalizeSearchText(c.name) === normalizeSearchText(REPORT_CHANNEL_NAME)) && c.isTextBased()
     );
 
     if (modLogChannel) {
@@ -610,16 +636,8 @@ function normalizeSearchText(value) {
     .replace(/<a?:[^:>]+:\d+>/g, ' ')
     .replace(/<@&\d+>/g, ' ')
     .replace(/<@!?\d+>/g, ' ')
-    // Treat Discord styling/decorators as noise.
-    .replace(/[^a-z0-9]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+    .replace(/[^a-z0-9]+/g, ' ').trim();
 }
-
-function compactRoleText(value) {
-  return normalizeSearchText(value).replace(/\s+/g, '');
-}
-
 function levenshtein(a, b) {
   if (a === b) return 0;
   if (!a.length) return b.length;
@@ -627,151 +645,37 @@ function levenshtein(a, b) {
   const prev = Array.from({ length: b.length + 1 }, (_, i) => i);
   for (let i = 0; i < a.length; i++) {
     const cur = [i + 1];
-    for (let j = 0; j < b.length; j++) {
-      cur[j + 1] = Math.min(
-        cur[j] + 1,
-        prev[j + 1] + 1,
-        prev[j] + (a[i] === b[j] ? 0 : 1)
-      );
-    }
+    for (let j = 0; j < b.length; j++) cur[j + 1] = Math.min(cur[j] + 1, prev[j + 1] + 1, prev[j] + (a[i] === b[j] ? 0 : 1));
     for (let j = 0; j < cur.length; j++) prev[j] = cur[j];
   }
   return prev[b.length];
 }
-
-// Damerau-Levenshtein catches common human typos like "medai" -> "media".
-function damerauLevenshtein(a, b) {
-  if (a === b) return 0;
-  if (!a.length) return b.length;
-  if (!b.length) return a.length;
-
-  const da = new Map();
-  const maxDist = a.length + b.length;
-  const rows = Array.from({ length: a.length + 2 }, () =>
-    new Array(b.length + 2).fill(0)
-  );
-  rows[0][0] = maxDist;
-  for (let i = 0; i <= a.length; i++) {
-    rows[i + 1][0] = maxDist;
-    rows[i + 1][1] = i;
-  }
-  for (let j = 0; j <= b.length; j++) {
-    rows[0][j + 1] = maxDist;
-    rows[1][j + 1] = j;
-  }
-
-  for (let i = 1; i <= a.length; i++) {
-    let db = 0;
-    for (let j = 1; j <= b.length; j++) {
-      const i1 = da.get(b[j - 1]) || 0;
-      const j1 = db;
-      let cost = 1;
-      if (a[i - 1] === b[j - 1]) {
-        cost = 0;
-        db = j;
-      }
-      rows[i + 1][j + 1] = Math.min(
-        rows[i][j] + cost,
-        rows[i + 1][j] + 1,
-        rows[i][j + 1] + 1,
-        rows[i1][j1] + (i - i1 - 1) + 1 + (j - j1 - 1)
-      );
-    }
-    da.set(a[i - 1], i);
-  }
-  return rows[a.length + 1][b.length + 1];
-}
-
-function tokenSimilarity(query, roleName) {
-  const qTokens = normalizeSearchText(query).split(' ').filter(Boolean);
-  const rTokens = normalizeSearchText(roleName).split(' ').filter(Boolean);
-  if (!qTokens.length || !rTokens.length) return 0;
-
-  let total = 0;
-  for (const q of qTokens) {
-    let best = 0;
-    for (const r of rTokens) {
-      if (q === r) best = 1;
-      else if (r.startsWith(q) || q.startsWith(r)) {
-        best = Math.max(best, 0.93);
-      } else {
-        const d = damerauLevenshtein(q, r);
-        best = Math.max(best, 1 - d / Math.max(q.length, r.length));
-      }
-    }
-    total += best;
-  }
-  return total / qTokens.length;
-}
-
 function roleSimilarity(query, role) {
-  const q = normalizeSearchText(query);
-  const r = normalizeSearchText(role.name);
+  const q = normalizeSearchText(query), r = normalizeSearchText(role.name);
   if (!q || !r) return 0;
   if (q === r) return 1;
-
-  const qc = compactRoleText(query);
-  const rc = compactRoleText(role.name);
-  if (qc === rc) return 1;
-
-  // Ignore cosmetic words/separators and reward a clean substring match.
-  if (r.includes(q)) return q.length >= 3 ? 0.97 : 0.82;
-  if (q.includes(r)) return r.length >= 3 ? 0.95 : 0.80;
-  if (rc.includes(qc)) return qc.length >= 3 ? 0.96 : 0.80;
-  if (qc.includes(rc)) return rc.length >= 3 ? 0.94 : 0.80;
-
-  const editScore = Math.max(0, 1 - damerauLevenshtein(qc, rc) / Math.max(qc.length, rc.length));
-  const tokenScore = tokenSimilarity(q, r);
-
-  // Weighted score favors the actual role name shape, while still tolerating typos,
-  // missing separators, emojis, brackets, and word-order noise.
-  return Math.max(
-    editScore * 0.72 + tokenScore * 0.28,
-    tokenScore * 0.86 + editScore * 0.14
-  );
+  if (r.includes(q)) return 0.94;
+  if (q.includes(r)) return 0.90;
+  return Math.max(0, 1 - levenshtein(q, r) / Math.max(q.length, r.length));
 }
-
 function resolveRole(guild, query) {
   const raw = String(query || '').trim();
   const mention = raw.match(/^<@&(\d+)>$/);
   if (mention) {
     const role = guild.roles.cache.get(mention[1]);
-    if (role) return { role, ambiguous: [], score: 1 };
+    if (role) return { role, ambiguous: [] };
   }
-
   const normalized = normalizeSearchText(raw);
-  if (!normalized) return { role: null, ambiguous: [] };
-
-  const roles = guild.roles.cache.filter(r => !r.managed && r.id !== guild.id);
-  const exact = roles.find(r => normalizeSearchText(r.name) === normalized);
-  if (exact) return { role: exact, ambiguous: [], score: 1 };
-
-  const candidates = roles
+  const exact = guild.roles.cache.find(r => !r.managed && r.id !== guild.id && normalizeSearchText(r.name) === normalized);
+  if (exact) return { role: exact, ambiguous: [] };
+  const candidates = guild.roles.cache.filter(r => !r.managed && r.id !== guild.id)
     .map(role => ({ role, score: roleSimilarity(raw, role) }))
     .sort((a, b) => b.score - a.score);
-
-  if (!candidates.length) return { role: null, ambiguous: [] };
-
-  const top = candidates[0];
-  const second = candidates[1];
-
-  // High-confidence unique match: the bot can act without asking the admin to
-  // retype the exact decorated role name.
-  if (
-    top.score >= 0.78 &&
-    (!second || top.score - second.score >= 0.10 || top.score >= 0.93)
-  ) {
-    return { role: top.role, ambiguous: [], score: top.score };
-  }
-
-  // Medium confidence: show the closest roles instead of guessing. This keeps the
-  // command forgiving without turning a near-match into an unsafe role assignment.
-  const close = candidates.filter(c => c.score >= Math.max(0.58, top.score - 0.16)).slice(0, 5);
-  if (top.score >= 0.58) return { role: null, ambiguous: close, score: top.score };
-
-  return { role: null, ambiguous: [] };
+  if (!candidates.length || candidates[0].score < 0.65) return { role: null, ambiguous: [] };
+  const [top, second] = candidates;
+  if (top.score >= 0.88 && (!second || top.score - second.score >= 0.07)) return { role: top.role, ambiguous: [] };
+  return { role: null, ambiguous: candidates.slice(0, 5) };
 }
-
 function getStaffRoles(guild) {
   return guild.roles.cache.filter(role => {
     const n = normalizeSearchText(role.name);
@@ -839,6 +743,114 @@ async function sendTemporary(channel, content, ms = 5000) {
   return msg;
 }
 
+
+async function groqJson(system, user, schema, model = GROQ_MODEL) {
+  if (!AI_ENABLED) return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  try {
+    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST', signal: controller.signal,
+      headers: { 'Authorization': `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model, temperature: 0, max_tokens: 700,
+        messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+        response_format: { type: 'json_schema', json_schema: { name: 'spark_result', strict: true, schema } }
+      })
+    });
+    const body = await res.text();
+    if (!res.ok) throw new Error(body || `Groq HTTP ${res.status}`);
+    const payload = JSON.parse(body);
+    const content = payload?.choices?.[0]?.message?.content;
+    if (!content) return null;
+    return JSON.parse(content);
+  } finally { clearTimeout(timer); }
+}
+
+const MODERATION_SCHEMA = {
+  type:'object', properties:{
+    decision:{type:'string', enum:['allow','review','remove']},
+    category:{type:'string', enum:['none','harassment','hate','sexual','spam','scam','phishing','threat','other']},
+    confidence:{type:'number'}, reason:{type:'string'}
+  }, required:['decision','category','confidence','reason'], additionalProperties:false
+};
+
+async function aiModerateMessage(message, signals) {
+  if (!AI_ENABLED) return null;
+  const now = Date.now();
+  const last = aiCooldowns.get(message.author.id) || 0;
+  if (now - last < 2500) return null;
+  aiCooldowns.set(message.author.id, now);
+  const text = String(message.content || '').slice(0, 2000);
+  return groqJson(
+    'You are Spark, a conservative Discord safety classifier. Protect normal conversation. Gaming slang, abbreviations such as mc/yt/ig, ordinary profanity used without targeting, YouTube/Instagram/GIF/media links, and harmless jokes should normally be allowed. Only remove when the message clearly contains serious abuse, hate, threats, phishing/scam, or obvious spam. Use review when uncertain. Never infer missing context.',
+    `Message: ${text}\nLocal signals: ${signals.join(', ') || 'none'}`,
+    MODERATION_SCHEMA,
+    GROQ_MODEL
+  );
+}
+
+function snapshotServer(guild) {
+  const bots = guild.members.cache.filter(m => m.user.bot);
+  const roles = [...guild.roles.cache.values()].filter(r => !r.managed).map(r => ({name:r.name, permissions:r.permissions.toArray()}));
+  const channels = [...guild.channels.cache.values()].map(c => ({name:c.name, type:c.type, parent:c.parent?.name || null}));
+  return {
+    name:guild.name, memberCount:guild.memberCount,
+    onlineCount:guild.members.cache.filter(m=>m.presence?.status && m.presence.status !== 'offline').size,
+    botCount:bots.size, roles:roles.slice(0,80), channels:channels.slice(0,120)
+  };
+}
+
+async function aiCommunitySummary(guild) {
+  const db = loadData();
+  const days = Object.entries(db.activity || {}).sort().slice(-7);
+  const channelActivity = [...liveChannelActivity.values()].sort((a,b)=>b.count-a.count).slice(0,15);
+  return groqJson(
+    'You are a Discord community analyst. Use only supplied metrics. State trends, not guesses about causes. Be concise and useful to a server owner.',
+    JSON.stringify({days, channelActivity, server:snapshotServer(guild)}),
+    {type:'object',properties:{summary:{type:'string'},positives:{type:'array',items:{type:'string'}},watch:{type:'array',items:{type:'string'}}},required:['summary','positives','watch'],additionalProperties:false},
+    GROQ_STRONG_MODEL
+  );
+}
+
+async function aiReportSummary() {
+  const db = loadData();
+  const reports = (db.reports || []).slice(-50);
+  return groqJson(
+    'Summarize moderation reports neutrally. Reports are allegations, not proof. Identify repeated themes only when directly supported. Do not recommend punishment.',
+    JSON.stringify(reports),
+    {type:'object',properties:{summary:{type:'string'},themes:{type:'array',items:{type:'string'}},caution:{type:'string'}},required:['summary','themes','caution'],additionalProperties:false},
+    GROQ_STRONG_MODEL
+  );
+}
+
+function buildDiagnostics(guild) {
+  const issues=[];
+  const adminRoles=guild.roles.cache.filter(r=>!r.managed && r.permissions.has(PermissionFlagsBits.Administrator));
+  const roleManagers=guild.roles.cache.filter(r=>!r.managed && r.permissions.has(PermissionFlagsBits.ManageRoles));
+  const channelManagers=guild.roles.cache.filter(r=>!r.managed && r.permissions.has(PermissionFlagsBits.ManageChannels));
+  const adminBots=guild.members.cache.filter(m=>m.user.bot && m.permissions.has(PermissionFlagsBits.Administrator));
+  if(adminRoles.size>1) issues.push(`⚠️ ${adminRoles.size} human roles have Administrator.`);
+  if(roleManagers.size>4) issues.push(`⚠️ ${roleManagers.size} roles can manage roles.`);
+  if(channelManagers.size>5) issues.push(`⚠️ ${channelManagers.size} roles can manage channels.`);
+  if(adminBots.size) issues.push(`🚨 ${adminBots.size} bot(s) have Administrator.`);
+  const emptyTracked=[...liveChannelActivity.values()].filter(v=>Date.now()-v.timestamp>30*24*60*60*1000);
+  if(emptyTracked.length) issues.push(`ℹ️ ${emptyTracked.length} tracked channel(s) have been quiet for 30+ days.`);
+  return issues.length?issues:['✅ No obvious high-level problem found by the quick scan.'];
+}
+
+async function createServerBackup(guild) {
+  const backup={
+    exportedAt:new Date().toISOString(), guild:{id:guild.id,name:guild.name},
+    roles:[...guild.roles.cache.values()].map(r=>({id:r.id,name:r.name,position:r.position,color:r.hexColor,managed:r.managed,permissions:r.permissions.bitfield.toString()})),
+    channels:[...guild.channels.cache.values()].map(c=>({id:c.id,name:c.name,type:c.type,position:c.position,parentId:c.parentId,topic:c.topic||null,permissionOverwrites:c.permissionOverwrites?.cache ? [...c.permissionOverwrites.cache.values()].map(o=>({id:o.id,type:o.type,allow:o.allow.bitfield.toString(),deny:o.deny.bitfield.toString()})) : []})),
+    source:'Spark NETHRION backup'
+  };
+  const file=`./backup-${guild.id}-${Date.now()}.json`;
+  fs.writeFileSync(file,JSON.stringify(backup,null,2));
+  return file;
+}
+
 const liveChannelActivity = new Map();
 const liveMessageActivity = new Map();
 const liveDailyActivity = new Map();
@@ -866,29 +878,40 @@ client.on('messageCreate', async (message) => {
   // Keep Spark deliberately conservative. Normal slang and normal links stay untouched.
   // Command messages are handled by the command layer and are not auto-moderated as chat.
   if (!isAdmin && !cmdString) {
-    let violationReason = null;
-    if (containsBadWord(message.content)) violationReason = 'Toxic / abusive language';
+    const signals = [];
     const urlReason = suspiciousUrlReason(message.content);
-    if (urlReason && !violationReason) violationReason = urlReason;
-    if (isMassMentionAbuse(message) && !violationReason) violationReason = 'Mass mention abuse';
+    if (containsBadWord(message.content)) signals.push('potential abusive language');
+    if (urlReason) signals.push(urlReason);
+    if (isMassMentionAbuse(message)) signals.push('mass mention pattern');
 
-    if (violationReason) {
-      await message.delete().catch(() => {});
-      await sendTemporary(message.channel, `⚠️ <@${message.author.id}>, that message was removed by Spark.`, 5000);
-      const reports = await getOrCreateReportsChannel(message.guild).catch(() => null);
-      if (reports) {
-        const embed = new EmbedBuilder()
-          .setTitle('🚨 Spark Security Report')
-          .setColor('#e74c3c')
-          .addFields(
-            { name: 'User', value: `${message.author.tag} (\`${message.author.id}\`)`, inline: true },
-            { name: 'Channel', value: `<#${message.channel.id}>`, inline: true },
-            { name: 'Reason', value: violationReason, inline: true },
-            { name: 'Content', value: message.content ? `\`\`\`\n${message.content.slice(0, 3500)}\n\`\`\`` : '*No text content*' }
-          ).setTimestamp();
-        await reports.send({ embeds: [embed], allowedMentions: { parse: [] } }).catch(() => {});
+    if (signals.length) {
+      let decision = null;
+      if (urlReason && /executable|deceptive|malformed|unauthorized discord invite/i.test(urlReason)) {
+        decision = {decision:'remove',category:urlReason.toLowerCase().includes('invite')?'spam':'phishing',confidence:0.99,reason:urlReason};
+      } else if (isMassMentionAbuse(message)) {
+        decision = {decision:'remove',category:'spam',confidence:0.99,reason:'Mass mention abuse'};
+      } else if (AI_ENABLED) {
+        decision = await aiModerateMessage(message, signals).catch(err => { console.error('[Groq Moderation]', err.message); return null; });
+      } else if (containsBadWord(message.content)) {
+        decision = {decision:'remove',category:'harassment',confidence:0.90,reason:'Toxic / abusive language'};
       }
-      return;
+
+      if (decision?.decision === 'remove' && Number(decision.confidence) >= 0.90) {
+        await message.delete().catch(()=>{});
+        await sendTemporary(message.channel, `⚠️ <@${message.author.id}>, that message was removed by Spark.`, 5000);
+        const reports = await getOrCreateReportsChannel(message.guild).catch(()=>null);
+        if (reports) {
+          const embed=new EmbedBuilder().setTitle('🚨 Spark Security Report').setColor('#e74c3c').addFields(
+            {name:'User',value:`${message.author.tag} (\`${message.author.id}\`)`,inline:true},
+            {name:'Channel',value:`<#${message.channel.id}>`,inline:true},
+            {name:'Reason',value:String(decision.reason).slice(0,256),inline:true},
+            {name:'Content',value:message.content?`\`\`\`\n${message.content.slice(0,3500)}\n\`\`\``:'*No text content*'}
+          ).setTimestamp();
+          await reports.send({embeds:[embed],allowedMentions:{parse:[]}}).catch(()=>{});
+        }
+        return;
+      }
+      // Conservative rule: review/allow does not delete the member's message.
     }
   }
 
@@ -982,6 +1005,19 @@ client.on('messageCreate', async (message) => {
       await message.channel.send({ embeds: [embed] });
     }
     return;
+  }
+
+  if (subCmd === 'ip') {
+    const cfg=db.smpConfig || {...DEFAULT_SMP};
+    const javaIp=cfg.javaHost, bedrockIp=cfg.bedrockHost || DEFAULT_SMP.bedrockHost;
+    const bedrockPort=cfg.bedrockPort || DEFAULT_SMP.bedrockPort, javaPort=cfg.javaPort || 25565;
+    const embed=new EmbedBuilder().setTitle('📌 SERVER DETAILS').setColor('#5865F2').setDescription([
+      `🌐 **Java IP:** \`${javaIp}\``,
+      `🪨 **Bedrock IP:** \`${bedrockIp}\``,
+      `📱 **Bedrock Port:** \`${bedrockPort}\``,
+      `💻 **Java Port:** ${javaPort===25565?'Default (`25565`)':`\`${javaPort}\``}`
+    ].join('\n'));
+    return message.channel.send({embeds:[embed]});
   }
 
   if (subCmd === 'report') {
@@ -1353,6 +1389,64 @@ client.on('messageCreate', async (message) => {
     return message.channel.send({ embeds: [lbEmbed] });
   }
 
+  if (subCmd === 'summary') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild)) return message.reply('❌ Manage Server permission required.');
+    const result=await aiCommunitySummary(message.guild).catch(()=>null);
+    if(!result) return message.reply(AI_ENABLED?'❌ Spark AI could not create the summary right now.':'❌ Add `GROQ_API_KEY` to enable Spark AI.');
+    return message.channel.send({embeds:[new EmbedBuilder().setTitle('📊 NETHRION COMMUNITY PULSE').setColor('#5865F2').setDescription(result.summary).addFields(
+      {name:'✅ Going Well',value:result.positives?.slice(0,5).map(x=>`• ${x}`).join('\n')||'Nothing clear yet.'},
+      {name:'👀 Watch',value:result.watch?.slice(0,5).map(x=>`• ${x}`).join('\n')||'Nothing obvious yet.'}
+    ).setTimestamp()]});
+  }
+
+  if (subCmd === 'cases') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ViewAuditLog)) return message.reply('❌ View Audit Log permission required.');
+    const result=await aiReportSummary().catch(()=>null);
+    if(!result) return message.reply(AI_ENABLED?'❌ Spark AI could not summarize reports right now.':'❌ Add `GROQ_API_KEY` to enable Spark AI.');
+    return message.channel.send({embeds:[new EmbedBuilder().setTitle('🧾 REPORT SUMMARY').setColor('#e67e22').setDescription(result.summary).addFields(
+      {name:'Themes',value:result.themes?.slice(0,6).map(x=>`• ${x}`).join('\n')||'None'},
+      {name:'Caution',value:result.caution||'Reports are allegations, not proof.'}
+    ).setTimestamp()]});
+  }
+
+  if (subCmd === 'profile') {
+    const target=message.mentions.members.first()||message.member;
+    const u=db.streaks?.[target.id]||{};
+    const reportCount=(db.reports||[]).filter(r=>r.targetId===target.id).length;
+    const link=db.links?.[target.id]?.minecraftUsername||'Not linked';
+    const roles=target.roles.cache.filter(r=>r.id!==message.guild.id).sort((a,b)=>b.position-a.position).first(8).map(r=>r.name).join(', ')||'None';
+    return message.channel.send({embeds:[new EmbedBuilder().setTitle(`👤 ${target.displayName}`).setColor('#5865F2').setThumbnail(target.user.displayAvatarURL()).addFields(
+      {name:'Roles',value:roles}, {name:'Minecraft',value:`\`${link}\``,inline:true}, {name:'Reports',value:`\`${reportCount}\``,inline:true}, {name:'Streak',value:`\`${u.currentStreak||0} days\``,inline:true}
+    ).setTimestamp()]});
+  }
+
+  if (subCmd === 'diagnose') {
+    if (!message.member.permissions.has(PermissionFlagsBits.ManageGuild)) return message.reply('❌ Manage Server permission required.');
+    const lines=buildDiagnostics(message.guild);
+    let description=lines.join('\n');
+    if(AI_ENABLED){
+      const ai=await groqJson('Review this Discord diagnostic list. Do not invent problems. Return one concise priority note explaining the most important risk or improvement.',description,{type:'object',properties:{priority:{type:'string'}},required:['priority'],additionalProperties:false},GROQ_MODEL).catch(()=>null);
+      if(ai?.priority) description += `\n\n🧠 **Priority:** ${ai.priority}`;
+    }
+    return message.channel.send({embeds:[new EmbedBuilder().setTitle('🩺 SPARK SERVER DIAGNOSIS').setColor('#5865F2').setDescription(description).setFooter({text:'Quick scan · verify before changing anything'}).setTimestamp()]});
+  }
+
+  if (subCmd === 'backup') {
+    if(message.author.id!==message.guild.ownerId && !message.member.permissions.has(PermissionFlagsBits.ManageGuild)) return message.reply('❌ Manage Server permission required.');
+    const file=await createServerBackup(message.guild);
+    const sent=await message.channel.send({content:'💾 **NETHRION backup created.**',files:[file]});
+    setTimeout(()=>sent.delete().catch(()=>{}),15000); fs.unlink(file,()=>{}); return;
+  }
+
+  if (subCmd === 'ask') {
+    if(!AI_ENABLED) return message.reply('❌ Spark AI is disabled. Add `GROQ_API_KEY` first.');
+    const q=cmdString.slice(3).trim(); if(!q) return message.reply('Usage: `sp ask <question>`');
+    const result=await groqJson('You are Spark, a practical Discord operations assistant for NETHRION. Use only the provided server snapshot. Never invent features or facts. Be concise and use simple English/Hinglish when it helps.',JSON.stringify({question:q,server:snapshotServer(message.guild),recentActivity:[...liveChannelActivity.values()].sort((a,b)=>b.count-a.count).slice(0,10)}),{type:'object',properties:{answer:{type:'string'},confidence:{type:'number'},caveat:{type:'string'}},required:['answer','confidence','caveat'],additionalProperties:false},GROQ_STRONG_MODEL).catch(()=>null);
+    if(!result) return message.reply('❌ Spark AI could not answer right now.');
+    return message.channel.send({embeds:[new EmbedBuilder().setTitle('⚡ SPARK').setColor('#5865F2').setDescription(result.answer).setFooter({text:`Confidence ${Math.round((Number(result.confidence)||0)*100)}%${result.caveat?` · ${result.caveat}`:''}`})]});
+  }
+
+
   if (cmdLower === 'help admin') {
     if (!message.member.permissions.has(PermissionFlagsBits.Administrator)) {
       return message.reply('❌ This command is restricted to Admins!');
@@ -1371,7 +1465,10 @@ client.on('messageCreate', async (message) => {
             '`sp streak` - View your or a member\'s streak profile.',
             '`sp board` - View top 10 active streaks leaderboard.',
             '`sp suggest <idea>` - Send community suggestion.',
-            '`sp report @user <reason>` - Send a private report.'
+            '`sp report @user <reason>` - Send a private report.',
+            '`sp ip` - Show SMP IP and port details.',
+            '`sp ask <question>` - Ask Spark for a careful answer.',
+            '`sp profile [@user]` - View a member summary.'
           ].join('\n')
         },
         {
@@ -1386,7 +1483,11 @@ client.on('messageCreate', async (message) => {
             '`sp slock @user` / `sp sunlock @user` - User/bot channel lock.',
             '`sp purge <count>` / `sp purge @user <count>` / `sp purge @user <min>min` - Cleanup recent messages.',
             '`sp roles-panel` - Post the notification-role selector.',
-            '`sp link @user MinecraftIGN` - Manually store a Minecraft link when DiscordSRV does not expose it.'
+            '`sp link @user MinecraftIGN` - Manually store a Minecraft link when DiscordSRV does not expose it.',
+            '`sp diagnose` - Scan the server for obvious configuration risks.',
+            '`sp backup` - Export the server structure to JSON.',
+            '`sp summary` - AI-assisted community pulse.',
+            '`sp cases` - AI-assisted report summary.'
           ].join('\n')
         }
       )
@@ -1410,6 +1511,9 @@ client.on('messageCreate', async (message) => {
           '`sp board` - View the streak leaderboard.',
           '`sp suggest <idea>` - Send a community suggestion.',
           '`sp report @user <reason>` - Send a private report.',
+            '`sp ip` - Show SMP IP and port details.',
+            '`sp ask <question>` - Ask Spark for a careful answer.',
+            '`sp profile [@user]` - View a member summary.',
         ].join('\n')
       })
       .setFooter({ text: 'NETHRION community' })
@@ -1503,6 +1607,8 @@ client.on('messageCreate', async (message) => {
 
 client.on('voiceStateUpdate', async (oldState, newState) => {
   try {
+    if (newState.channel) liveChannelActivity.set(newState.channel.id, { timestamp: Date.now(), count: newState.channel.members.size, name: newState.channel.name, type:'voice' });
+    if (oldState.channel) liveChannelActivity.set(oldState.channel.id, { timestamp: Date.now(), count: oldState.channel.members.size, name: oldState.channel.name, type:'voice' });
     const { member, guild } = newState;
 
     if (newState.channel) {
@@ -1539,6 +1645,27 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
     console.error('[VC Error]:', err.message);
   }
 });
+
+function securityBurstHit(guild, key, threshold=4, windowMs=10000) {
+  const now=Date.now(), mapKey=`${guild.id}:${key}`;
+  const recent=(securityBurst.get(mapKey)||[]).filter(t=>now-t<windowMs); recent.push(now); securityBurst.set(mapKey,recent); return recent.length>=threshold;
+}
+async function emitSecurityAlert(guild,title,detail) {
+  const ch=await getOrCreateReportsChannel(guild).catch(()=>null); if(!ch) return;
+  await ch.send({embeds:[new EmbedBuilder().setTitle(`🚨 ${title}`).setColor('#e74c3c').setDescription(detail).setTimestamp()],allowedMentions:{parse:[]}}).catch(()=>{});
+}
+client.on(Events.RoleCreate, async role=>{
+  if(!role.managed && (role.permissions.has(PermissionFlagsBits.Administrator)||role.permissions.has(PermissionFlagsBits.ManageRoles)) && securityBurstHit(role.guild,'role-power-create')) await emitSecurityAlert(role.guild,'POWERFUL ROLE CREATED',`Role: **${role.name}**\nReview its permissions and creator in the Audit Log.`);
+});
+client.on(Events.RoleUpdate, async (oldRole,newRole)=>{
+  if(!oldRole.permissions.equals(newRole.permissions)) {
+    const gained=newRole.permissions.bitfield & ~oldRole.permissions.bitfield;
+    if(gained) await emitSecurityAlert(newRole.guild,'ROLE POWER CHANGED',`Role: **${newRole.name}**\nNew permissions were detected. Review the Audit Log.`);
+  }
+});
+client.on(Events.RoleDelete, async role=>{ if(securityBurstHit(role.guild,'role-delete')) await emitSecurityAlert(role.guild,'ROLE DELETIONS SPIKE',`Multiple roles were deleted in a short period.`); });
+client.on(Events.ChannelDelete, async channel=>{ if(securityBurstHit(channel.guild,'channel-delete')) await emitSecurityAlert(channel.guild,'CHANNEL DELETIONS SPIKE',`Multiple channels were deleted in a short period.`); });
+
 
 process.on('unhandledRejection', err => console.error('[Unhandled Rejection]', err));
 process.on('uncaughtException', err => console.error('[Uncaught Exception]', err));

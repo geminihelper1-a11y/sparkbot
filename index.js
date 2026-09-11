@@ -41,8 +41,6 @@ const DEFAULT_SMP = {
   bedrockPort: 26091
 };
 const REPORT_CHANNEL_NAME = '🚨-【-reports-】';
-let lastMcPanelFingerprint = null;
-let mcPanelUpdateInFlight = false;
 const STAFF_ROLE_NAMES = ['owner', 'admin', 'moderator', 'trainee', 'helper'];
 
 function saveData(data) {
@@ -162,7 +160,7 @@ async function fetchFullStatus(javaHost, javaPort, bedrockHost, bedrockPort) {
     motd: cleanMotd(java?.motd?.clean || bedrock?.motd?.clean || '') || 'NETHRION SMP',
     playerList,
     javaIp: javaPort === 25565 ? javaHost : `${javaHost}:${javaPort}`,
-    bedrockIp: bedrockHost,
+    bedrockIp: `${bedrockHost}:${bedrockPort}`,
     bedrockPort,
     retrievedAt: java?.retrieved_at || bedrock?.retrieved_at || Date.now()
   };
@@ -188,69 +186,34 @@ function buildSimpleMCEmbed(ip, data) {
 }
 
 function buildPanelEmbed(data) {
-  const names = (data.playerList || []).slice(0, 20);
-  const hasPlayers = Number(String(data.playersOnline).split('/')[0]) > 0;
-  const playerField = hasPlayers
-    ? (names.length ? names.map(name => `\`${name}\``).join(' · ') : 'Player names are unavailable.')
-    : 'The Server is Waiting for You, Come Fast.';
-
-  const javaPortText = Number(data.javaPort || 25565) === 25565 ? 'Default (`25565`)' : `\`${Number(data.javaPort)}\``;
-  const serverDetails = [
-    `🌐 **Java IP:** \`${data.javaIp || data.javaHost || '—'}\``,
-    `🪨 **Bedrock IP:** \`${data.bedrockIp || data.bedrockHost || '—'}\``,
-    `📱 **Bedrock Port:** \`${data.bedrockPort || '—'}\``,
-    `💻 **Java Port:** ${javaPortText}`
-  ].join('\n');
-
+  const names = (data.playerList || []).slice(0, 10);
   return new EmbedBuilder()
     .setTitle('⛏️ NETHRION SMP')
     .setColor(data.isOnline ? '#2ecc71' : '#e74c3c')
-    .setDescription(`${data.isOnline ? '🟢 **Online**' : '🔴 **Offline**'} · ${data.playersOnline} players`)
+    .setDescription(`${data.isOnline ? '🟢 **Online**' : '🔴 **Offline**'}  ·  ${data.playersOnline} players`)
     .addFields(
-      { name: '👥 Players', value: trimField(playerField, 1024), inline: false },
-      { name: '📌 SERVER DETAILS', value: trimField(serverDetails, 1024), inline: false }
+      { name: 'Java', value: `\`${data.javaIp}\`  ${data.javaOnline ? '🟢' : '🔴'}`, inline: true },
+      { name: 'Bedrock', value: `\`${data.bedrockIp}\`  ${data.bedrockOnline ? '🟢' : '🔴'}`, inline: true },
+      { name: 'Version', value: `\`${trimField(data.version, 80)}\``, inline: true },
+      { name: 'Online Now', value: names.length ? trimField(names.join(', '), 900) : 'No player names exposed by the server.', inline: false }
     )
+    .setFooter({ text: 'Player names are only shown when exposed by the server • updates every 60s' })
     .setTimestamp();
 }
 
-function buildMcPanelFingerprint(data) {
-  return JSON.stringify({
-    isOnline: data.isOnline,
-    javaOnline: data.javaOnline,
-    bedrockOnline: data.bedrockOnline,
-    playersOnline: data.playersOnline,
-    version: data.version,
-    playerList: (data.playerList || []).slice(0, 20),
-    javaIp: data.javaIp,
-    bedrockIp: data.bedrockIp,
-    bedrockPort: data.bedrockPort
-  });
-}
-
 async function updateMCPanel() {
-  if (mcPanelUpdateInFlight) return;
-  mcPanelUpdateInFlight = true;
+  const db = loadData();
+  if (!db.mcPanel?.channelId || !db.mcPanel?.messageId) return;
   try {
-    const db = loadData();
-    if (!db.mcPanel?.channelId || !db.mcPanel?.messageId) return;
-    const cfg = db.smpConfig || { ...DEFAULT_SMP };
-    const data = await fetchFullStatus(cfg.javaHost, cfg.javaPort, cfg.bedrockHost, cfg.bedrockPort);
-    const fingerprint = buildMcPanelFingerprint(data);
-
-    // Poll every 15s, but only edit Discord when the actual status changed.
-    if (fingerprint === lastMcPanelFingerprint) return;
-
     const channel = await client.channels.fetch(db.mcPanel.channelId).catch(() => null);
     if (!channel) return;
     const message = await channel.messages.fetch(db.mcPanel.messageId).catch(() => null);
     if (!message) return;
-
+    const cfg = db.smpConfig || { ...DEFAULT_SMP };
+    const data = await fetchFullStatus(cfg.javaHost, cfg.javaPort, cfg.bedrockHost, cfg.bedrockPort);
     await message.edit({ embeds: [buildPanelEmbed(data)] });
-    lastMcPanelFingerprint = fingerprint;
   } catch (err) {
     console.error('[MC Panel Error]:', err.message);
-  } finally {
-    mcPanelUpdateInFlight = false;
   }
 }
 
@@ -293,8 +256,9 @@ client.once(Events.ClientReady, () => {
   console.log(`🔥 Spark Bot is ONLINE as ${client.user.tag}`);
   console.log(`=================================\n`);
 
-  // Poll every 15s; update Discord only when the observed SMP state changes.
-  setInterval(updateMCPanel, 15 * 1000);
+  // 30s is the safe floor: fast enough to feel "live", but won't risk Discord's
+  // message-edit rate limit or hammer the Minecraft server with pings.
+  setInterval(updateMCPanel, 60 * 1000);
   setTimeout(updateMCPanel, 3000);
   setInterval(checkYouTubeUploads, 5 * 60 * 1000);
   setInterval(() => {
@@ -646,8 +610,16 @@ function normalizeSearchText(value) {
     .replace(/<a?:[^:>]+:\d+>/g, ' ')
     .replace(/<@&\d+>/g, ' ')
     .replace(/<@!?\d+>/g, ' ')
-    .replace(/[^a-z0-9]+/g, ' ').trim();
+    // Treat Discord styling/decorators as noise.
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
+
+function compactRoleText(value) {
+  return normalizeSearchText(value).replace(/\s+/g, '');
+}
+
 function levenshtein(a, b) {
   if (a === b) return 0;
   if (!a.length) return b.length;
@@ -655,37 +627,151 @@ function levenshtein(a, b) {
   const prev = Array.from({ length: b.length + 1 }, (_, i) => i);
   for (let i = 0; i < a.length; i++) {
     const cur = [i + 1];
-    for (let j = 0; j < b.length; j++) cur[j + 1] = Math.min(cur[j] + 1, prev[j + 1] + 1, prev[j] + (a[i] === b[j] ? 0 : 1));
+    for (let j = 0; j < b.length; j++) {
+      cur[j + 1] = Math.min(
+        cur[j] + 1,
+        prev[j + 1] + 1,
+        prev[j] + (a[i] === b[j] ? 0 : 1)
+      );
+    }
     for (let j = 0; j < cur.length; j++) prev[j] = cur[j];
   }
   return prev[b.length];
 }
+
+// Damerau-Levenshtein catches common human typos like "medai" -> "media".
+function damerauLevenshtein(a, b) {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+
+  const da = new Map();
+  const maxDist = a.length + b.length;
+  const rows = Array.from({ length: a.length + 2 }, () =>
+    new Array(b.length + 2).fill(0)
+  );
+  rows[0][0] = maxDist;
+  for (let i = 0; i <= a.length; i++) {
+    rows[i + 1][0] = maxDist;
+    rows[i + 1][1] = i;
+  }
+  for (let j = 0; j <= b.length; j++) {
+    rows[0][j + 1] = maxDist;
+    rows[1][j + 1] = j;
+  }
+
+  for (let i = 1; i <= a.length; i++) {
+    let db = 0;
+    for (let j = 1; j <= b.length; j++) {
+      const i1 = da.get(b[j - 1]) || 0;
+      const j1 = db;
+      let cost = 1;
+      if (a[i - 1] === b[j - 1]) {
+        cost = 0;
+        db = j;
+      }
+      rows[i + 1][j + 1] = Math.min(
+        rows[i][j] + cost,
+        rows[i + 1][j] + 1,
+        rows[i][j + 1] + 1,
+        rows[i1][j1] + (i - i1 - 1) + 1 + (j - j1 - 1)
+      );
+    }
+    da.set(a[i - 1], i);
+  }
+  return rows[a.length + 1][b.length + 1];
+}
+
+function tokenSimilarity(query, roleName) {
+  const qTokens = normalizeSearchText(query).split(' ').filter(Boolean);
+  const rTokens = normalizeSearchText(roleName).split(' ').filter(Boolean);
+  if (!qTokens.length || !rTokens.length) return 0;
+
+  let total = 0;
+  for (const q of qTokens) {
+    let best = 0;
+    for (const r of rTokens) {
+      if (q === r) best = 1;
+      else if (r.startsWith(q) || q.startsWith(r)) {
+        best = Math.max(best, 0.93);
+      } else {
+        const d = damerauLevenshtein(q, r);
+        best = Math.max(best, 1 - d / Math.max(q.length, r.length));
+      }
+    }
+    total += best;
+  }
+  return total / qTokens.length;
+}
+
 function roleSimilarity(query, role) {
-  const q = normalizeSearchText(query), r = normalizeSearchText(role.name);
+  const q = normalizeSearchText(query);
+  const r = normalizeSearchText(role.name);
   if (!q || !r) return 0;
   if (q === r) return 1;
-  if (r.includes(q)) return 0.94;
-  if (q.includes(r)) return 0.90;
-  return Math.max(0, 1 - levenshtein(q, r) / Math.max(q.length, r.length));
+
+  const qc = compactRoleText(query);
+  const rc = compactRoleText(role.name);
+  if (qc === rc) return 1;
+
+  // Ignore cosmetic words/separators and reward a clean substring match.
+  if (r.includes(q)) return q.length >= 3 ? 0.97 : 0.82;
+  if (q.includes(r)) return r.length >= 3 ? 0.95 : 0.80;
+  if (rc.includes(qc)) return qc.length >= 3 ? 0.96 : 0.80;
+  if (qc.includes(rc)) return rc.length >= 3 ? 0.94 : 0.80;
+
+  const editScore = Math.max(0, 1 - damerauLevenshtein(qc, rc) / Math.max(qc.length, rc.length));
+  const tokenScore = tokenSimilarity(q, r);
+
+  // Weighted score favors the actual role name shape, while still tolerating typos,
+  // missing separators, emojis, brackets, and word-order noise.
+  return Math.max(
+    editScore * 0.72 + tokenScore * 0.28,
+    tokenScore * 0.86 + editScore * 0.14
+  );
 }
+
 function resolveRole(guild, query) {
   const raw = String(query || '').trim();
   const mention = raw.match(/^<@&(\d+)>$/);
   if (mention) {
     const role = guild.roles.cache.get(mention[1]);
-    if (role) return { role, ambiguous: [] };
+    if (role) return { role, ambiguous: [], score: 1 };
   }
+
   const normalized = normalizeSearchText(raw);
-  const exact = guild.roles.cache.find(r => !r.managed && r.id !== guild.id && normalizeSearchText(r.name) === normalized);
-  if (exact) return { role: exact, ambiguous: [] };
-  const candidates = guild.roles.cache.filter(r => !r.managed && r.id !== guild.id)
+  if (!normalized) return { role: null, ambiguous: [] };
+
+  const roles = guild.roles.cache.filter(r => !r.managed && r.id !== guild.id);
+  const exact = roles.find(r => normalizeSearchText(r.name) === normalized);
+  if (exact) return { role: exact, ambiguous: [], score: 1 };
+
+  const candidates = roles
     .map(role => ({ role, score: roleSimilarity(raw, role) }))
     .sort((a, b) => b.score - a.score);
-  if (!candidates.length || candidates[0].score < 0.65) return { role: null, ambiguous: [] };
-  const [top, second] = candidates;
-  if (top.score >= 0.88 && (!second || top.score - second.score >= 0.07)) return { role: top.role, ambiguous: [] };
-  return { role: null, ambiguous: candidates.slice(0, 5) };
+
+  if (!candidates.length) return { role: null, ambiguous: [] };
+
+  const top = candidates[0];
+  const second = candidates[1];
+
+  // High-confidence unique match: the bot can act without asking the admin to
+  // retype the exact decorated role name.
+  if (
+    top.score >= 0.78 &&
+    (!second || top.score - second.score >= 0.10 || top.score >= 0.93)
+  ) {
+    return { role: top.role, ambiguous: [], score: top.score };
+  }
+
+  // Medium confidence: show the closest roles instead of guessing. This keeps the
+  // command forgiving without turning a near-match into an unsafe role assignment.
+  const close = candidates.filter(c => c.score >= Math.max(0.58, top.score - 0.16)).slice(0, 5);
+  if (top.score >= 0.58) return { role: null, ambiguous: close, score: top.score };
+
+  return { role: null, ambiguous: [] };
 }
+
 function getStaffRoles(guild) {
   return guild.roles.cache.filter(role => {
     const n = normalizeSearchText(role.name);

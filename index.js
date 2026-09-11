@@ -171,6 +171,26 @@ function trimField(text, max = 1024) {
   return value.length > max ? `${value.slice(0, max - 1)}…` : value;
 }
 
+
+function buildSmpIpMessage(cfg) {
+  const javaHost = cfg?.javaHost || DEFAULT_SMP.javaHost;
+  const javaPort = Number(cfg?.javaPort || DEFAULT_SMP.javaPort);
+  const bedrockHost = cfg?.bedrockHost || DEFAULT_SMP.bedrockHost;
+  const bedrockPort = Number(cfg?.bedrockPort || DEFAULT_SMP.bedrockPort);
+  const javaAddress = javaPort === 25565 ? javaHost : `${javaHost}:${javaPort}`;
+
+  return [
+    '**[📌](https://discord.com/assets/c7ba45651998dd2c.svg) SERVER DETAILS:**',
+    '',
+    `- [🌐](https://discord.com/assets/34f5679881a6a6e3.svg) **Java IP:** \`${javaAddress}\``,
+    '',
+    `**Bedrock IP:** \`${bedrockHost}\``,
+    '',
+    `- [📱](https://discord.com/assets/a1ba0dd930cfd819.svg) **Bedrock Port:** \`${bedrockPort}\``,
+    `- [💻](https://discord.com/assets/c66649a1b3353499.svg) **Java Port:** ${javaPort === 25565 ? 'Default (`25565`)' : `\`${javaPort}\``}`
+  ].join('\n');
+}
+
 function buildSimpleMCEmbed(ip, data) {
   const embed = new EmbedBuilder().setTitle('⛏️ Minecraft Server').setTimestamp();
   if (data.isOnline) {
@@ -883,6 +903,11 @@ client.on('messageCreate', async (message) => {
     return sendTemporary(message.channel, '✅ Report sent privately to the NETHRION staff.', 5000);
   }
 
+  if (subCmd === 'ip') {
+    const cfg = db.smpConfig || { ...DEFAULT_SMP };
+    return message.reply({ content: buildSmpIpMessage(cfg), allowedMentions: { parse: [] } });
+  }
+
   if (subCmd === 'smp-set') {
     if (message.author.id !== message.guild.ownerId && !message.member.permissions.has(PermissionFlagsBits.ManageGuild)) return message.reply('❌ You need **Manage Server** to configure the SMP.');
     const smpArgs = cmdString.split(/\s+/).slice(1);
@@ -1288,6 +1313,7 @@ client.on('messageCreate', async (message) => {
           '`sp board` - View the streak leaderboard.',
           '`sp suggest <idea>` - Send a community suggestion.',
           '`sp report @user <reason>` - Send a private report.',
+          '`sp ip` - Show the current NETHRION SMP connection details.',
         ].join('\n')
       })
       .setFooter({ text: 'NETHRION community' })

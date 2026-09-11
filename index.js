@@ -41,6 +41,8 @@ const DEFAULT_SMP = {
   bedrockPort: 26091
 };
 const REPORT_CHANNEL_NAME = '🚨-【-reports-】';
+let lastMcPanelFingerprint = null;
+let mcPanelUpdateInFlight = false;
 const STAFF_ROLE_NAMES = ['owner', 'admin', 'moderator', 'trainee', 'helper'];
 
 function saveData(data) {
@@ -171,24 +173,6 @@ function trimField(text, max = 1024) {
   return value.length > max ? `${value.slice(0, max - 1)}…` : value;
 }
 
-
-function buildSmpIpMessage(cfg) {
-  const javaHost = cfg?.javaHost || DEFAULT_SMP.javaHost;
-  const javaPort = Number(cfg?.javaPort || DEFAULT_SMP.javaPort);
-  const bedrockHost = cfg?.bedrockHost || DEFAULT_SMP.bedrockHost;
-  const bedrockPort = Number(cfg?.bedrockPort || DEFAULT_SMP.bedrockPort);
-  const javaAddress = javaPort === 25565 ? javaHost : `${javaHost}:${javaPort}`;
-
-  return [
-    '📌 **SERVER DETAILS**',
-    '',
-    `🌐 **Java IP:** \`${javaAddress}\``,
-    `🪨 **Bedrock IP:** \`${bedrockHost}\``,
-    `📱 **Bedrock Port:** \`${bedrockPort}\``,
-    `💻 **Java Port:** ${javaPort === 25565 ? 'Default (`25565`)' : `\`${javaPort}\``}`
-  ].join('\n');
-}
-
 function buildSimpleMCEmbed(ip, data) {
   const embed = new EmbedBuilder().setTitle('⛏️ Minecraft Server').setTimestamp();
   if (data.isOnline) {
@@ -204,34 +188,62 @@ function buildSimpleMCEmbed(ip, data) {
 }
 
 function buildPanelEmbed(data) {
-  const names = (data.playerList || []).slice(0, 10);
+  const names = (data.playerList || []).slice(0, 20);
+  const hasPlayers = Number(String(data.playersOnline).split('/')[0]) > 0;
+  const playerField = hasPlayers
+    ? (names.length ? names.map(name => `\`${name}\``).join(' · ') : 'Player names are unavailable.')
+    : 'The Server is Waiting for You, Come Fast.';
+
   return new EmbedBuilder()
     .setTitle('⛏️ NETHRION SMP')
     .setColor(data.isOnline ? '#2ecc71' : '#e74c3c')
-    .setDescription(`${data.isOnline ? '🟢 **Online**' : '🔴 **Offline**'}  ·  ${data.playersOnline} players`)
-    .addFields(
-      { name: 'Java', value: `\`${data.javaIp}\`  ${data.javaOnline ? '🟢' : '🔴'}`, inline: true },
-      { name: 'Bedrock', value: `\`${data.bedrockIp}\`  ${data.bedrockOnline ? '🟢' : '🔴'}`, inline: true },
-      { name: 'Version', value: `\`${trimField(data.version, 80)}\``, inline: true },
-      { name: 'Online Now', value: names.length ? trimField(names.join(', '), 900) : 'No player names exposed by the server.', inline: false }
-    )
-    .setFooter({ text: 'Player names are only shown when exposed by the server • updates every 60s' })
+    .setDescription(`${data.isOnline ? '🟢 **Online**' : '🔴 **Offline**'} · ${data.playersOnline} players`)
+    .addFields({
+      name: '👥 Players',
+      value: trimField(playerField, 1024),
+      inline: false
+    })
     .setTimestamp();
 }
 
+function buildMcPanelFingerprint(data) {
+  return JSON.stringify({
+    isOnline: data.isOnline,
+    javaOnline: data.javaOnline,
+    bedrockOnline: data.bedrockOnline,
+    playersOnline: data.playersOnline,
+    version: data.version,
+    playerList: (data.playerList || []).slice(0, 20),
+    javaIp: data.javaIp,
+    bedrockIp: data.bedrockIp,
+    bedrockPort: data.bedrockPort
+  });
+}
+
 async function updateMCPanel() {
-  const db = loadData();
-  if (!db.mcPanel?.channelId || !db.mcPanel?.messageId) return;
+  if (mcPanelUpdateInFlight) return;
+  mcPanelUpdateInFlight = true;
   try {
+    const db = loadData();
+    if (!db.mcPanel?.channelId || !db.mcPanel?.messageId) return;
+    const cfg = db.smpConfig || { ...DEFAULT_SMP };
+    const data = await fetchFullStatus(cfg.javaHost, cfg.javaPort, cfg.bedrockHost, cfg.bedrockPort);
+    const fingerprint = buildMcPanelFingerprint(data);
+
+    // Poll every 15s, but only edit Discord when the actual status changed.
+    if (fingerprint === lastMcPanelFingerprint) return;
+
     const channel = await client.channels.fetch(db.mcPanel.channelId).catch(() => null);
     if (!channel) return;
     const message = await channel.messages.fetch(db.mcPanel.messageId).catch(() => null);
     if (!message) return;
-    const cfg = db.smpConfig || { ...DEFAULT_SMP };
-    const data = await fetchFullStatus(cfg.javaHost, cfg.javaPort, cfg.bedrockHost, cfg.bedrockPort);
+
     await message.edit({ embeds: [buildPanelEmbed(data)] });
+    lastMcPanelFingerprint = fingerprint;
   } catch (err) {
     console.error('[MC Panel Error]:', err.message);
+  } finally {
+    mcPanelUpdateInFlight = false;
   }
 }
 
@@ -274,9 +286,8 @@ client.once(Events.ClientReady, () => {
   console.log(`🔥 Spark Bot is ONLINE as ${client.user.tag}`);
   console.log(`=================================\n`);
 
-  // 30s is the safe floor: fast enough to feel "live", but won't risk Discord's
-  // message-edit rate limit or hammer the Minecraft server with pings.
-  setInterval(updateMCPanel, 60 * 1000);
+  // Poll every 15s; update Discord only when the observed SMP state changes.
+  setInterval(updateMCPanel, 15 * 1000);
   setTimeout(updateMCPanel, 3000);
   setInterval(checkYouTubeUploads, 5 * 60 * 1000);
   setInterval(() => {
@@ -901,11 +912,6 @@ client.on('messageCreate', async (message) => {
     return sendTemporary(message.channel, '✅ Report sent privately to the NETHRION staff.', 5000);
   }
 
-  if (subCmd === 'ip') {
-    const cfg = db.smpConfig || { ...DEFAULT_SMP };
-    return message.reply({ content: buildSmpIpMessage(cfg), allowedMentions: { parse: [] } });
-  }
-
   if (subCmd === 'smp-set') {
     if (message.author.id !== message.guild.ownerId && !message.member.permissions.has(PermissionFlagsBits.ManageGuild)) return message.reply('❌ You need **Manage Server** to configure the SMP.');
     const smpArgs = cmdString.split(/\s+/).slice(1);
@@ -1311,7 +1317,6 @@ client.on('messageCreate', async (message) => {
           '`sp board` - View the streak leaderboard.',
           '`sp suggest <idea>` - Send a community suggestion.',
           '`sp report @user <reason>` - Send a private report.',
-          '`sp ip` - Show the current NETHRION SMP connection details.',
         ].join('\n')
       })
       .setFooter({ text: 'NETHRION community' })

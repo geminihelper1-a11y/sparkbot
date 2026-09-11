@@ -180,14 +180,12 @@ function buildSmpIpMessage(cfg) {
   const javaAddress = javaPort === 25565 ? javaHost : `${javaHost}:${javaPort}`;
 
   return [
-    '**[📌](https://discord.com/assets/c7ba45651998dd2c.svg) SERVER DETAILS:**',
+    '📌 **SERVER DETAILS**',
     '',
-    `- [🌐](https://discord.com/assets/34f5679881a6a6e3.svg) **Java IP:** \`${javaAddress}\``,
-    '',
-    `**Bedrock IP:** \`${bedrockHost}\``,
-    '',
-    `- [📱](https://discord.com/assets/a1ba0dd930cfd819.svg) **Bedrock Port:** \`${bedrockPort}\``,
-    `- [💻](https://discord.com/assets/c66649a1b3353499.svg) **Java Port:** ${javaPort === 25565 ? 'Default (`25565`)' : `\`${javaPort}\``}`
+    `🌐 **Java IP:** \`${javaAddress}\``,
+    `🪨 **Bedrock IP:** \`${bedrockHost}\``,
+    `📱 **Bedrock Port:** \`${bedrockPort}\``,
+    `💻 **Java Port:** ${javaPort === 25565 ? 'Default (`25565`)' : `\`${javaPort}\``}`
   ].join('\n');
 }
 

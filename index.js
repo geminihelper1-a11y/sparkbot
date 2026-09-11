@@ -251,7 +251,7 @@ async function checkYouTubeUploads() {
   }
 }
 
-client.once('ready', () => {
+client.once(Events.ClientReady, () => {
   console.log(`\n=================================`);
   console.log(`🔥 Spark Bot is ONLINE as ${client.user.tag}`);
   console.log(`=================================\n`);
@@ -811,7 +811,7 @@ client.on('messageCreate', async (message) => {
   const subCmd = args[0].toLowerCase();
 
   if (subCmd === 'role') {
-    if (message.author.id !== message.guild.ownerId && !message.member.permissions.has(PermissionFlagsBits.ManageRoles)) return message.reply('❌ You need **Manage Roles** to use this command.');
+    if (message.author.id !== message.guild.ownerId && !message.member.permissions.has(PermissionFlagsBits.ManageRoles)) return message.reply('❌ Admin/Role Manager permission required.');
     const { roleQuery } = splitRoleAndMentions(cmdString.slice(4).trim());
     const targets = getMentionedMembers(message);
     if (!roleQuery || !targets.length) return message.reply('Usage: `sp role <role name> @user @user ...`');
@@ -837,7 +837,7 @@ client.on('messageCreate', async (message) => {
   }
 
   if (subCmd === 'rolelist') {
-    if (message.author.id !== message.guild.ownerId && !message.member.permissions.has(PermissionFlagsBits.ManageRoles)) return message.reply('❌ You need **Manage Roles** to use this command.');
+    if (message.author.id !== message.guild.ownerId && !message.member.permissions.has(PermissionFlagsBits.ManageRoles)) return message.reply('❌ Admin/Role Manager permission required.');
     const roleQuery = cmdString.slice('rolelist'.length).trim();
     if (!roleQuery) return message.reply('Usage: `sp rolelist <role name>`');
     const resolved = resolveRole(message.guild, roleQuery);
@@ -908,26 +908,6 @@ client.on('messageCreate', async (message) => {
     return message.reply(`✅ Linked **${target.user.tag}** → **${ign}**.`);
   }
 
-  if (subCmd === 'health' || subCmd === 'server') {
-    if (subCmd === 'health' && message.author.id !== message.guild.ownerId && !message.member.permissions.has(PermissionFlagsBits.ManageGuild)) return message.reply('❌ You need **Manage Server** to use this command.');
-    const guild = message.guild;
-    const now = Date.now();
-    const online = guild.members.cache.filter(m => m.presence?.status && m.presence.status !== 'offline').size;
-    const voiceChannels = guild.channels.cache.filter(c => c.type === ChannelType.GuildVoice);
-    const activeVoice = [...voiceChannels.values()].filter(c => c.members.size > 0).sort((a,b) => b.members.size - a.members.size);
-    const activeText = [...liveChannelActivity.values()].filter(x => now - x.timestamp <= 15*60*1000).sort((a,b) => b.timestamp - a.timestamp).slice(0,5);
-    const embed = new EmbedBuilder().setTitle('📡 NETHRION Live').setColor('#5865F2')
-      .setDescription(`**${guild.name}**  ·  ${online}/${guild.memberCount} online`)
-      .addFields(
-        { name:'💬 Text', value: activeText.length ? activeText.map(x => `#${x.name}`).join('\n') : 'Quiet right now', inline:true },
-        { name:'🎙️ Voice', value: activeVoice.length ? activeVoice.slice(0,5).map(c => `${c.name} · ${c.members.size}`).join('\n') : 'No active VC', inline:true },
-        { name:'👥 Members', value:`${guild.memberCount}`, inline:true },
-        { name:'🟢 Online', value:`${online}`, inline:true },
-        { name:'🎙️ In VC', value:`${activeVoice.reduce((n,c)=>n+c.members.size,0)}`, inline:true },
-        { name:'📅 Today', value:`${liveDailyActivity.get(today)?.messages || db.activity?.[today]?.messages || 0} messages`, inline:true }
-      ).setFooter({ text:'Live activity is based on what Spark can currently see.' }).setTimestamp();
-    return message.channel.send({ embeds:[embed] });
-  }
 
   if (cmdLower === 'lock') {
     if (!message.member.permissions.has(PermissionFlagsBits.ManageChannels)) {
@@ -1269,15 +1249,14 @@ client.on('messageCreate', async (message) => {
             '`sp streak` - View your or a member\'s streak profile.',
             '`sp board` - View top 10 active streaks leaderboard.',
             '`sp suggest <idea>` - Send community suggestion.',
-            '`sp report @user <reason>` - Send a private report.',
-            '`sp role <role> @user...` - Bulk-assign a role.',
-            '`sp rolelist <role>` - List members with a role.',
-            '`sp server` - Show a live Discord activity snapshot.'
+            '`sp report @user <reason>` - Send a private report.'
           ].join('\n')
         },
         {
           name: '👑 Admin Commands',
           value: [
+            '`sp role <role> @user...` - Bulk-assign a role (Manage Roles required).',
+            '`sp rolelist <role>` - List members with a role (Manage Roles required).',
             '`sp smp-set <java-ip[:port]> [bedrock-ip] [bedrock-port]` - Configure the SMP source.',
             '`sp smp-panel` - Setup the live auto-updating SMP panel.',
             '`sp yt-setup <yt_channel_id>` - Setup YouTube upload notifications.',
@@ -1309,7 +1288,6 @@ client.on('messageCreate', async (message) => {
           '`sp board` - View the streak leaderboard.',
           '`sp suggest <idea>` - Send a community suggestion.',
           '`sp report @user <reason>` - Send a private report.',
-          '`sp server` - Show a live Discord activity snapshot.'
         ].join('\n')
       })
       .setFooter({ text: 'NETHRION community' })

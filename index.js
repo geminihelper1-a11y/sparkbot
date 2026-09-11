@@ -162,7 +162,7 @@ async function fetchFullStatus(javaHost, javaPort, bedrockHost, bedrockPort) {
     motd: cleanMotd(java?.motd?.clean || bedrock?.motd?.clean || '') || 'NETHRION SMP',
     playerList,
     javaIp: javaPort === 25565 ? javaHost : `${javaHost}:${javaPort}`,
-    bedrockIp: `${bedrockHost}:${bedrockPort}`,
+    bedrockIp: bedrockHost,
     bedrockPort,
     retrievedAt: java?.retrieved_at || bedrock?.retrieved_at || Date.now()
   };

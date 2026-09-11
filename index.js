@@ -194,15 +194,22 @@ function buildPanelEmbed(data) {
     ? (names.length ? names.map(name => `\`${name}\``).join(' · ') : 'Player names are unavailable.')
     : 'The Server is Waiting for You, Come Fast.';
 
+  const javaPortText = Number(data.javaPort || 25565) === 25565 ? 'Default (`25565`)' : `\`${Number(data.javaPort)}\``;
+  const serverDetails = [
+    `🌐 **Java IP:** \`${data.javaIp || data.javaHost || '—'}\``,
+    `🪨 **Bedrock IP:** \`${data.bedrockIp || data.bedrockHost || '—'}\``,
+    `📱 **Bedrock Port:** \`${data.bedrockPort || '—'}\``,
+    `💻 **Java Port:** ${javaPortText}`
+  ].join('\n');
+
   return new EmbedBuilder()
     .setTitle('⛏️ NETHRION SMP')
     .setColor(data.isOnline ? '#2ecc71' : '#e74c3c')
     .setDescription(`${data.isOnline ? '🟢 **Online**' : '🔴 **Offline**'} · ${data.playersOnline} players`)
-    .addFields({
-      name: '👥 Players',
-      value: trimField(playerField, 1024),
-      inline: false
-    })
+    .addFields(
+      { name: '👥 Players', value: trimField(playerField, 1024), inline: false },
+      { name: '📌 SERVER DETAILS', value: trimField(serverDetails, 1024), inline: false }
+    )
     .setTimestamp();
 }
 

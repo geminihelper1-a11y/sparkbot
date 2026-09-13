@@ -631,12 +631,48 @@ function isSafeLink(text) {
 }
 
 function normalizeSearchText(value) {
-  return String(value || '').toLowerCase().normalize('NFKD')
+  let text = String(value || '')
+    .normalize('NFKD')
     .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[\u200B-\u200D\uFEFF]/g, ' ')
+    .replace(/[\uFE0E\uFE0F]/g, ' ')
     .replace(/<a?:[^:>]+:\d+>/g, ' ')
     .replace(/<@&\d+>/g, ' ')
-    .replace(/<@!?\d+>/g, ' ')
-    .replace(/[^a-z0-9]+/g, ' ').trim();
+    .replace(/<@!?\d+>/g, ' ');
+
+  // Discord role names are sometimes styled with Mathematical Alphanumeric
+  // Unicode characters (𝗠𝗘𝗗𝗜𝗔, 𝘔𝘌𝘋𝘐𝘈, etc.). Those are visually different
+  // but semantically the same. Convert the common styled ranges to ASCII.
+  let out = '';
+  for (const ch of text) {
+    const cp = ch.codePointAt(0);
+    let mapped = null;
+    const ranges = [
+      [0x1D400, 0x1D419, 0x41], [0x1D41A, 0x1D433, 0x61],
+      [0x1D434, 0x1D44D, 0x41], [0x1D44E, 0x1D467, 0x61],
+      [0x1D468, 0x1D481, 0x41], [0x1D482, 0x1D49B, 0x61],
+      [0x1D49C, 0x1D4B5, 0x41], [0x1D4B6, 0x1D4CF, 0x61],
+      [0x1D4D0, 0x1D4E9, 0x41], [0x1D4EA, 0x1D503, 0x61],
+      [0x1D504, 0x1D51D, 0x41], [0x1D51E, 0x1D537, 0x61],
+      [0x1D538, 0x1D551, 0x41], [0x1D552, 0x1D56B, 0x61],
+      [0x1D56C, 0x1D585, 0x41], [0x1D586, 0x1D59F, 0x61],
+      [0x1D5A0, 0x1D5B9, 0x41], [0x1D5BA, 0x1D5D3, 0x61],
+      [0x1D5D4, 0x1D5ED, 0x41], [0x1D5EE, 0x1D607, 0x61],
+      [0x1D608, 0x1D621, 0x41], [0x1D622, 0x1D63B, 0x61],
+      [0x1D63C, 0x1D655, 0x41], [0x1D656, 0x1D66F, 0x61],
+      [0x1D670, 0x1D689, 0x41], [0x1D68A, 0x1D6A3, 0x61],
+      [0x1D6E8, 0x1D701, 0x41], [0x1D702, 0x1D71B, 0x61],
+      [0x1D7CE, 0x1D7D7, 0x30]
+    ];
+    for (const [lo, hi, ascii] of ranges) {
+      if (cp >= lo && cp <= hi) { mapped = String.fromCodePoint(ascii + (cp - lo)); break; }
+    }
+    out += mapped || ch;
+  }
+  return out.toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 function levenshtein(a, b) {
   if (a === b) return 0;
@@ -650,31 +686,129 @@ function levenshtein(a, b) {
   }
   return prev[b.length];
 }
+function jaroWinkler(a, b) {
+  if (a === b) return 1;
+  if (!a || !b) return 0;
+  const maxDist = Math.max(Math.floor(Math.max(a.length, b.length) / 2) - 1, 0);
+  const aMatch = Array(a.length).fill(false);
+  const bMatch = Array(b.length).fill(false);
+  let matches = 0;
+  for (let i = 0; i < a.length; i++) {
+    const start = Math.max(0, i - maxDist), end = Math.min(i + maxDist + 1, b.length);
+    for (let j = start; j < end; j++) {
+      if (bMatch[j] || a[i] !== b[j]) continue;
+      aMatch[i] = true; bMatch[j] = true; matches++; break;
+    }
+  }
+  if (!matches) return 0;
+  const aSeq = [], bSeq = [];
+  for (let i = 0; i < a.length; i++) if (aMatch[i]) aSeq.push(a[i]);
+  for (let j = 0; j < b.length; j++) if (bMatch[j]) bSeq.push(b[j]);
+  let transpositions = 0;
+  for (let i = 0; i < aSeq.length; i++) if (aSeq[i] !== bSeq[i]) transpositions++;
+  const m = matches;
+  const jaro = (m / a.length + m / b.length + (m - transpositions / 2) / m) / 3;
+  let prefix = 0;
+  for (let i = 0; i < Math.min(4, a.length, b.length); i++) { if (a[i] !== b[i]) break; prefix++; }
+  return jaro + prefix * 0.1 * (1 - jaro);
+}
 function roleSimilarity(query, role) {
   const q = normalizeSearchText(query), r = normalizeSearchText(role.name);
   if (!q || !r) return 0;
   if (q === r) return 1;
-  if (r.includes(q)) return 0.94;
-  if (q.includes(r)) return 0.90;
-  return Math.max(0, 1 - levenshtein(q, r) / Math.max(q.length, r.length));
+
+  const qt = q.split(' '), rt = r.split(' ');
+  const qJoined = qt.join(''), rJoined = rt.join('');
+  const tokenHits = qt.filter(t => rt.includes(t)).length;
+  const tokenOverlap = tokenHits / Math.max(qt.length, rt.length);
+  const containment = r.includes(q) ? 0.975 : (q.includes(r) ? 0.94 : 0);
+  const edit = 1 - levenshtein(qJoined, rJoined) / Math.max(qJoined.length, rJoined.length);
+  const jw = jaroWinkler(qJoined, rJoined);
+
+  // Small, human-like typo tolerance: missing/swapped characters and
+  // spacing/punctuation differences should still produce a strong match.
+  const typoBoost = (qJoined.length >= 4 && rJoined.length >= 4 && Math.abs(qJoined.length-rJoined.length) <= 2)
+    ? Math.max(0, edit - 0.55) * 0.15
+    : 0;
+
+  return Math.min(1, Math.max(containment, jw * 0.68 + edit * 0.22 + tokenOverlap * 0.10 + typoBoost));
 }
-function resolveRole(guild, query) {
+async function getRoleCandidates(guild) {
+  // Always refresh from Discord before resolving a role. This prevents Spark
+  // from making decisions from a stale/partial role cache.
+  await guild.roles.fetch().catch(() => null);
+  return [...guild.roles.cache.values()]
+    .filter(r => !r.managed && r.id !== guild.id)
+    .map(role => ({
+      id: role.id,
+      name: role.name,
+      position: role.position,
+      members: role.members?.size || 0,
+      color: role.hexColor || '#000000',
+      hoist: Boolean(role.hoist),
+      botManaged: role.managed
+    }));
+}
+async function aiResolveRole(guild, query, candidates, purpose) {
+  if (!AI_ENABLED || !candidates.length) return null;
+  const allowed = new Set(candidates.map(r => r.id));
+  const schema = {
+    type: 'object',
+    properties: {
+      selectedId: { type: 'string' },
+      confidence: { type: 'number' },
+      reason: { type: 'string' }
+    },
+    required: ['selectedId', 'confidence', 'reason'],
+    additionalProperties: false
+  };
+  const system = [
+    'You are Spark, the NETHRION Discord role resolver.',
+    'Your job is entity resolution: map a human role description to ONE real role from the supplied live Discord role list.',
+    'The role list is authoritative. A role exists ONLY if its ID appears in that list. Never invent, rename, merge, or create roles.',
+    'Ignore decoration when it has no semantic meaning: emojis, brackets, pipes, dashes, separators, capitalization, spacing, and Unicode styled fonts.',
+    'Understand normal shorthand and small human mistakes: missing letters, swapped letters, duplicated letters, spacing differences, singular/plural forms, and partial names.',
+    'Use role color/position/member count only when the user description gives a meaningful clue such as "pink role", "top role", or "the one with members".',
+    'Prefer the strongest unique match. Do not pick a merely possible match when another role is nearly as plausible.',
+    'Never treat category headings, member-list labels, channel names, or imagined roles as evidence; only supplied Discord roles count.',
+    'For role assignment, choosing the wrong role is worse than asking for clarification.',
+    'If confidence is not high enough or the request is ambiguous, return an empty selectedId.',
+    `Purpose of this lookup: ${purpose}.`,
+    'The application will reject any selectedId not present in the supplied list.'
+  ].join(' ');
+  const user = JSON.stringify({
+    query: String(query || ''),
+    roles: candidates.map(r => ({id:r.id, name:r.name, memberCount:r.members, color:r.color, position:r.position, hoist:r.hoist}))
+  });
+  const result = await groqJson(system, user, schema, GROQ_MODEL).catch(() => null);
+  if (!result || !allowed.has(result.selectedId) || Number(result.confidence) < 0.72) return null;
+  return { role: candidates.find(r => r.id === result.selectedId), score: Number(result.confidence), reason: result.reason };
+}
+async function resolveRole(guild, query, purpose = 'role management') {
   const raw = String(query || '').trim();
   const mention = raw.match(/^<@&(\d+)>$/);
   if (mention) {
-    const role = guild.roles.cache.get(mention[1]);
-    if (role) return { role, ambiguous: [] };
+    const role = guild.roles.cache.get(mention[1]) || await guild.roles.fetch(mention[1]).catch(() => null);
+    if (role) return { role, ambiguous: [], source: 'mention' };
   }
+  const candidates = await getRoleCandidates(guild);
   const normalized = normalizeSearchText(raw);
-  const exact = guild.roles.cache.find(r => !r.managed && r.id !== guild.id && normalizeSearchText(r.name) === normalized);
-  if (exact) return { role: exact, ambiguous: [] };
-  const candidates = guild.roles.cache.filter(r => !r.managed && r.id !== guild.id)
-    .map(role => ({ role, score: roleSimilarity(raw, role) }))
-    .sort((a, b) => b.score - a.score);
-  if (!candidates.length || candidates[0].score < 0.65) return { role: null, ambiguous: [] };
-  const [top, second] = candidates;
-  if (top.score >= 0.88 && (!second || top.score - second.score >= 0.07)) return { role: top.role, ambiguous: [] };
-  return { role: null, ambiguous: candidates.slice(0, 5) };
+  const exact = candidates.find(r => normalizeSearchText(r.name) === normalized);
+  if (exact) return { role: guild.roles.cache.get(exact.id), ambiguous: [], source: 'exact' };
+
+  const scored = candidates.map(item => ({ role: guild.roles.cache.get(item.id), score: roleSimilarity(raw, item) }))
+    .filter(x => x.role).sort((a, b) => b.score - a.score);
+  const [top, second] = scored;
+  if (top && top.score >= 0.88 && (!second || top.score - second.score >= 0.06)) {
+    return { role: top.role, ambiguous: [], source: 'fuzzy', score: top.score };
+  }
+
+  // Only ask the AI when local matching cannot safely choose. The AI receives
+  // the real role list, not a description of what the roles might be.
+  const ai = await aiResolveRole(guild, raw, candidates, purpose);
+  if (ai?.role) return { role: guild.roles.cache.get(ai.role.id), ambiguous: [], source: 'ai', score: ai.score };
+
+  return { role: null, ambiguous: scored.slice(0, 5), source: 'ambiguous' };
 }
 function getStaffRoles(guild) {
   return guild.roles.cache.filter(role => {
@@ -960,7 +1094,7 @@ client.on('messageCreate', async (message) => {
     const { roleQuery } = splitRoleAndMentions(cmdString.slice(4).trim());
     const targets = getMentionedMembers(message);
     if (!roleQuery || !targets.length) return message.reply('Usage: `sp role <role name> @user @user ...`');
-    const resolved = resolveRole(message.guild, roleQuery);
+    const resolved = await resolveRole(message.guild, roleQuery, 'bulk role assignment');
     if (!resolved.role) {
       const choices = resolved.ambiguous.length ? resolved.ambiguous.map(x => `• **${x.role.name}**`).join('\n') : '';
       return message.reply(choices ? `🤔 Close matches — use a role mention or be more specific:\n${choices}` : `❌ I couldn't find a role close enough to **${roleQuery}**.`);
@@ -985,7 +1119,7 @@ client.on('messageCreate', async (message) => {
     if (message.author.id !== message.guild.ownerId && !message.member.permissions.has(PermissionFlagsBits.ManageRoles)) return message.reply('❌ Admin/Role Manager permission required.');
     const roleQuery = cmdString.slice('rolelist'.length).trim();
     if (!roleQuery) return message.reply('Usage: `sp rolelist <role name>`');
-    const resolved = resolveRole(message.guild, roleQuery);
+    const resolved = await resolveRole(message.guild, roleQuery, 'role member listing');
     if (!resolved.role) {
       const choices = resolved.ambiguous.length ? resolved.ambiguous.map(x => `• **${x.role.name}**`).join('\n') : '';
       return message.reply(choices ? `🤔 Close matches — use the exact role mention:\n${choices}` : `❌ I couldn't find that role.`);

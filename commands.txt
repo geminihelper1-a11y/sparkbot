@@ -909,7 +909,3 @@ client.on(Events.RoleCreate, async role=>{
   if(!role.managed && (role.permissions.has(PermissionFlagsBits.Administrator)||role.permissions.has(PermissionFlagsBits.ManageRoles)) && securityBurstHit(role.guild,'role-power-create')) await emitSecurityAlert(role.guild,'POWERFUL ROLE CREATED',`Role: **${role.name}**\nReview its permissions and creator in the Audit Log.`);
 });
 client.on(Events.RoleUpdate, async (oldRole,newRole)=>{
-
-
-DISCORDSRV LIVE PROFILE
-sp profile now performs a live DiscordSRV link lookup when the RCON + alerts bridge is configured. It supports accounts linked before Spark was installed.

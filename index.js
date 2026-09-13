@@ -23,9 +23,9 @@ require('dotenv').config();
 const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
 const GROQ_MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-20b';
 const GROQ_STRONG_MODEL = process.env.GROQ_STRONG_MODEL || 'openai/gpt-oss-120b';
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
-const IMAGE_MODEL = process.env.IMAGE_MODEL || 'gpt-image-2';
-const IMAGE_ENABLED = Boolean(OPENAI_API_KEY);
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const GEMINI_IMAGE_MODEL = process.env.GEMINI_IMAGE_MODEL || 'gemini-3.1-flash-image';
+const IMAGE_ENABLED = Boolean(GEMINI_API_KEY);
 const AI_ENABLED = Boolean(GROQ_API_KEY);
 
 const client = new Client({
@@ -45,9 +45,7 @@ const userSelectedChannels = new Map();
 const mcPanelFingerprint = new Map();
 const aiCooldowns = new Map();
 const securityBurst = new Map();
-const pendingDiscordSRVLookups = new Map();
 
-// DiscordSRV live-link lookups use the Discord console bridge; no RCON is required.
 // NETHRION SMP defaults; `sp smp-set` overrides them per guild.
 const DEFAULT_SMP = {
   javaHost: 'nethrionsmp.pixelforge.gg',
@@ -310,204 +308,22 @@ client.once(Events.ClientReady, () => {
   }, 60 * 1000);
 });
 
-
-function getDiscordSrvLookupChannelId() {
-  return String(process.env.DISCORDSRV_LINK_EVENT_CHANNEL_ID || '').trim();
-}
-
-function getDiscordSrvBotId() {
-  return String(process.env.DISCORDSRV_BOT_ID || '').trim();
-}
-
-function isValidDiscordId(value) {
-  return /^\d{17,20}$/.test(String(value || '').trim());
-}
-
-function getDiscordSrvConsoleChannelId() {
-  return String(process.env.DISCORDSRV_CONSOLE_CHANNEL_ID || '').trim();
-}
-
-function getDiscordSrvConsolePrefix() {
-  const prefix = String(process.env.DISCORDSRV_CONSOLE_PREFIX || '!c').trim();
-  return prefix || '!c';
-}
-
-function registerDiscordSrvLookup(discordId, timeoutMs = 8000) {
-  const key = String(discordId);
-  return new Promise((resolve) => {
-    const list = pendingDiscordSRVLookups.get(key) || [];
-    const entry = {
-      resolve: (value) => {
-        clearTimeout(entry.timer);
-        resolve(value);
-      },
-      timer: null
-    };
-
-    entry.timer = setTimeout(() => {
-      const current = pendingDiscordSRVLookups.get(key) || [];
-      const remaining = current.filter(item => item !== entry);
-      if (remaining.length) pendingDiscordSRVLookups.set(key, remaining);
-      else pendingDiscordSRVLookups.delete(key);
-      resolve(null);
-    }, timeoutMs);
-
-    list.push(entry);
-    pendingDiscordSRVLookups.set(key, list);
-  });
-}
-
-function parseMinecraftLinkLookup(message) {
-  const channelId = getDiscordSrvLookupChannelId();
-  if (channelId && message.channel.id !== channelId) return null;
-
-  const trustedBot = getDiscordSrvBotId();
-  if (trustedBot && message.author?.id !== trustedBot) return null;
-
-  const blobs = [];
-  if (message.content) blobs.push(String(message.content));
-  for (const e of message.embeds || []) {
-    if (e.title) blobs.push(String(e.title));
-    if (e.description) blobs.push(String(e.description));
-    if (e.author?.name) blobs.push(String(e.author.name));
-    for (const f of e.fields || []) blobs.push(`${f.name || ''} ${f.value || ''}`);
-  }
-  const text = blobs.join('\n');
-
-  const match = text.match(/SPARK_LOOKUP\|discord_id=(\d{17,20})\|minecraft_uuid=(null|[0-9a-f-]{32,36})\|minecraft_username=([A-Za-z0-9_]{3,16}|null)/i);
-  if (!match) return null;
-
-  return {
-    discordId: match[1],
-    minecraftUuid: match[2].toLowerCase() === 'null' ? null : match[2],
-    minecraftUsername: match[3].toLowerCase() === 'null' ? null : match[3],
-    createdAt: message.createdTimestamp || Date.now()
-  };
-}
-
-async function lookupDiscordSRVLink(discordId) {
-  if (!isValidDiscordId(discordId)) {
-    return { status: 'unavailable', reason: 'invalid Discord ID' };
-  }
-
-  const consoleChannelId = getDiscordSrvConsoleChannelId();
-  const lookupChannelId = getDiscordSrvLookupChannelId();
-
-  if (!consoleChannelId) {
-    return { status: 'unavailable', reason: 'DISCORDSRV_CONSOLE_CHANNEL_ID is not configured' };
-  }
-
-  if (!lookupChannelId) {
-    return { status: 'unavailable', reason: 'DISCORDSRV_LINK_EVENT_CHANNEL_ID is not configured' };
-  }
-
-  const channel = await client.channels.fetch(consoleChannelId).catch(() => null);
-  if (!channel || !channel.isTextBased() || typeof channel.send !== 'function') {
-    return { status: 'unavailable', reason: 'DiscordSRV console channel is unavailable to Spark' };
-  }
-
-  const requestedAt = Date.now();
-  const resultPromise = registerDiscordSrvLookup(discordId, 8000);
-  const command = `${getDiscordSrvConsolePrefix()} discordsrv linked ${discordId}`;
-
-  const sent = await channel.send({
-    content: command,
-    allowedMentions: { parse: [] }
-  }).catch(() => null);
-
-  if (!sent) {
-    const waiters = pendingDiscordSRVLookups.get(String(discordId)) || [];
-    pendingDiscordSRVLookups.delete(String(discordId));
-    for (const waiter of waiters) {
-      clearTimeout(waiter.timer);
-      waiter.resolve(null);
-    }
-    return { status: 'unavailable', reason: 'Could not send lookup command to DiscordSRV console channel' };
-  }
-
-  const result = await resultPromise;
-  if (!result || result.createdAt < requestedAt) {
-    return { status: 'unavailable', reason: 'DiscordSRV lookup response timed out' };
-  }
-
-  return result.minecraftUsername
-    ? { status: 'linked', ...result }
-    : { status: 'not_linked', ...result };
-}
-
 function parseMinecraftLinkEvent(message) {
-  // Authoritative DiscordSRV bridge. Spark runs remotely (e.g. Railway), so it cannot directly
-  // inspect DiscordSRV's JVM link manager. Instead, DiscordSRV should emit AccountLinkedEvent /
-  // AccountUnlinkedEvent to a channel that Spark can read. The explicit SPARK_LINK format below
-  // is preferred because it carries stable Discord + Minecraft IDs and cannot be confused with prose.
-  const blobs = [];
-  if (message.content) blobs.push(String(message.content));
-  for (const e of message.embeds || []) {
-    if (e.title) blobs.push(String(e.title));
-    if (e.description) blobs.push(String(e.description));
-    if (e.author?.name) blobs.push(String(e.author.name));
-    for (const f of e.fields || []) blobs.push(`${f.name || ''} ${f.value || ''}`);
-  }
-  const text = blobs.join('\n');
-
-  const allowedChannel = String(process.env.DISCORDSRV_LINK_EVENT_CHANNEL_ID || '').trim();
-  if (allowedChannel && message.channel.id !== allowedChannel) return null;
-  const trustedBot = String(process.env.DISCORDSRV_BOT_ID || '').trim();
-  if (trustedBot && message.author?.id !== trustedBot) return null;
-
-  let event = null;
-  const explicit = text.match(/SPARK_LINK\|event=(linked|unlinked)\|discord_id=(\d{17,20})(?:\|minecraft_uuid=([0-9a-f-]{32,36}))?\|minecraft_username=([A-Za-z0-9_]{3,16})/i);
-  if (explicit) {
-    event = { type: explicit[1].toLowerCase(), memberId: explicit[2], minecraftUuid: explicit[3] || null, username: explicit[4] };
-  }
-
-  if (!event) {
-    if (!/account\s*linked|linked\s+account|accountlinked|account\s*unlinked|unlinked\s+account/i.test(text)) return null;
-
-    const discordId = (
-      text.match(/(?:discord(?:\s+user(?:\s+id)?)?|user|discordid|discord\s*id)\s*[:=]\s*(\d{17,20})/i)?.[1] ||
-      text.match(/<@!?(\d{17,20})>/)?.[1] || null
-    );
-    const username = (
-      text.match(/(?:minecraft(?:\s+username)?|minecraft\s*name|username|player|ign|name)\s*[:=]\s*[`'" ]*([A-Za-z0-9_]{3,16})/i)?.[1] ||
-      text.match(/(?:player|minecraft)\s*[`'" ]*([A-Za-z0-9_]{3,16})[`'" ]*\s+(?:linked|has linked)/i)?.[1] || null
-    );
-    const uuid = text.match(/(?:minecraft\s*)?(?:uuid)\s*[:=]\s*[` ]*([0-9a-f-]{32,36})/i)?.[1] || null;
-    if (!discordId || !username) return null;
-    event = {
-      type: /unlinked/i.test(text) ? 'unlinked' : 'linked',
-      memberId: discordId,
-      minecraftUuid: uuid,
-      username
-    };
-  }
-
-  return event;
+  const text = message.content || '';
+  if (!/(account\s+linked|linked\s+account|successfully\s+linked|linked\s+to\s+minecraft)/i.test(text)) return null;
+  const member = [...message.mentions.members.values()][0] || null;
+  if (!member) return null;
+  const blacklist = /^(account|linked|welcome|minecraft|successfully|to|with|discord)$/i;
+  const candidates = [...text.matchAll(/\b([A-Za-z0-9_]{3,16})\b/g)].map(m => m[1]).filter(x => !/^unknown$/i.test(x) && !blacklist.test(x));
+  return candidates[0] ? { member, username: candidates[0] } : null;
 }
-
 async function handleMinecraftLinkEvent(message) {
   const parsed = parseMinecraftLinkEvent(message);
-  if (!parsed?.memberId || !parsed.username) return;
-  const member = await message.guild.members.fetch(parsed.memberId).catch(() => null);
-  if (!member || !/^[A-Za-z0-9_]{3,16}$/.test(parsed.username)) return;
-
+  if (!parsed) return;
   const db = loadData();
   db.links = db.links || {};
-
-  if (parsed.type === 'unlinked') {
-    delete db.links[member.id];
-    saveData(db);
-    return;
-  }
-
-  db.links[member.id] = {
-    minecraftUsername: parsed.username,
-    minecraftUuid: parsed.minecraftUuid || null,
-    linkedAt: db.links[member.id]?.linkedAt || new Date().toISOString(),
-    source: 'DiscordSRV'
-  };
+  db.links[parsed.member.id] = { minecraftUsername: parsed.username, linkedAt: new Date().toISOString() };
   saveData(db);
-
   const welcomeChannel = message.guild.channels.cache.find(c => c.isTextBased() && /welcome/i.test(c.name));
   if (welcomeChannel) {
     await welcomeChannel.send({
@@ -1167,28 +983,39 @@ Never add logos, watermarks, captions, or text unless the user explicitly asks f
 Do not force a cinematic look when it hurts the subject. Match the requested content first, then improve lighting, composition, detail, and color.
 `;
 
-async function generateOpenAIImage(userPrompt) {
-  if (!IMAGE_ENABLED) return null;
+async function generateGeminiImage(userPrompt) {
+  if (!GEMINI_API_KEY) return null;
   const prompt = `${NETHRION_IMAGE_STYLE_PROMPT}\n\nUSER REQUEST:\n${clampText(userPrompt, 3000)}`;
   try {
-    const response = await fetch('https://api.openai.com/v1/images/generations', {
+    const response = await fetch('https://generativelanguage.googleapis.com/v1beta/interactions', {
       method: 'POST',
-      headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: IMAGE_MODEL, prompt, size: '1024x1024', n: 1 })
+      headers: { 'x-goog-api-key': GEMINI_API_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: GEMINI_IMAGE_MODEL,
+        input: [{ type: 'text', text: prompt }],
+        response_format: { type: 'image', mime_type: 'image/png', aspect_ratio: '16:9', image_size: '2K' }
+      })
     });
     const raw = await response.text();
-    if (!response.ok) throw new Error(`Image API HTTP ${response.status}: ${raw.slice(0,500)}`);
+    if (!response.ok) throw new Error(`Gemini Image API HTTP ${response.status}: ${raw.slice(0, 1000)}`);
     const payload = JSON.parse(raw);
-    const item = payload?.data?.[0];
-    if (!item?.b64_json) return null;
+    let imageData = payload?.output_image?.data || null;
+    if (!imageData && Array.isArray(payload?.output)) {
+      for (let i = payload.output.length - 1; i >= 0; i--) {
+        const part = payload.output[i];
+        if (part?.data) { imageData = part.data; break; }
+        if (part?.image?.data) { imageData = part.image.data; break; }
+      }
+    }
+    if (!imageData) throw new Error('Gemini returned no image data.');
     const outDir = path.resolve('./generated-images');
     fs.mkdirSync(outDir, { recursive: true });
     const fileName = `spark-${Date.now()}-${Math.random().toString(36).slice(2,8)}.png`;
     const filePath = path.join(outDir, fileName);
-    fs.writeFileSync(filePath, Buffer.from(item.b64_json, 'base64'));
+    fs.writeFileSync(filePath, Buffer.from(imageData, 'base64'));
     return { filePath, promptUsed: prompt };
   } catch (err) {
-    console.error('[Image Generation]', err.message);
+    console.error('[Gemini Image Generation]', err.message);
     return null;
   }
 }
@@ -1451,10 +1278,14 @@ function getPublicGuildSnapshot(guild, member = null) {
   return { id:guild.id, name:guild.name, memberCount:guild.memberCount, roles:roleList, channels };
 }
 
-function isSparkChatAllowedChannel(channel) {
+function isSparkChatAllowedChannel(channel, member = null) {
   const n = String(channel?.name || '').toLowerCase();
   if (!channel || !channel.isTextBased?.()) return false;
-  return !/(report|admin|staff|bot-testing|bot-commands|anon-log|ticket)/i.test(n);
+  if (/bot-testing/i.test(n)) {
+    // Allow owners/admins to test Spark in the dedicated bot-testing channel.
+    return Boolean(member && (member.id === channel.guild?.ownerId || member.permissions?.has?.(PermissionFlagsBits.Administrator)));
+  }
+  return !/(report|admin|staff|bot-commands|anon-log|ticket)/i.test(n);
 }
 
 function stripSparkMention(message) {
@@ -1526,7 +1357,7 @@ function buildSparkTools(message, memberContext) {
   if (can.manageMessages) {
     tools.push(
       { type:'function', function:{ name:'purge_messages', description:'ACTUALLY delete recent messages from the CURRENT channel. Only call for an explicit delete/purge request. 1-20 can execute directly; above 20 requires the user to explicitly include/confirm the word confirm in the same request.', parameters:{type:'object',properties:{count:{type:'integer',minimum:1,maximum:100},confirm:{type:'boolean'}},required:['count','confirm'],additionalProperties:false} } },
-      { type:'function', function:{ name:'send_channel_message', description:'ACTUALLY send a message to an existing visible text channel. Only call for an explicit request to post/send/write a message. Requires Manage Messages or server owner. If the user\'s message contains a Discord channel mention, use that exact mentioned channel; decoration or naming style must never make a real channel undiscoverable. Never ping @everyone/@here automatically.', parameters:{type:'object',properties:{channel_query:{type:'string'},content:{type:'string',minLength:1,maxLength:1900}},required:['channel_query','content'],additionalProperties:false} } }
+      { type:'function', function:{ name:'send_channel_message', description:'ACTUALLY send a message to an existing visible text channel. Only call for an explicit request to post/send/write a message. Requires Manage Messages or server owner. Never ping @everyone/@here automatically.', parameters:{type:'object',properties:{channel_query:{type:'string'},content:{type:'string',minLength:1,maxLength:1900}},required:['channel_query','content'],additionalProperties:false} } }
     );
   }
   if (can.manageGuild) {
@@ -1570,63 +1401,24 @@ function findMentionedUserId(message, text) {
 }
 
 function normalizeChannelQuery(value) {
-  let raw = String(value || '').trim();
-  raw = raw.replace(/^<#(\d+)>$/, '$1');
-  // Remove a leading # used in natural language, while keeping real Discord mentions intact.
-  raw = raw.replace(/^#\s*/, '');
-  return normalizeSearchText(raw);
+  return normalizeSearchText(String(value || '').replace(/^<#(\d+)>$/, '').trim());
 }
 
-async function resolveActionChannel(guild, query, callerMember = null, message = null) {
-  // If the user actually mentioned a channel, that Discord ID is authoritative.
-  const mentioned = message?.mentions?.channels?.first?.();
-  if (mentioned) {
-    try {
-      if (!callerMember || callerMember.permissionsIn(mentioned).has(PermissionFlagsBits.ViewChannel)) return mentioned;
-    } catch {}
-  }
-
+async function resolveActionChannel(guild, query, callerMember = null) {
   const raw = String(query || '').trim();
-  const mention = raw.match(/<#(\d+)>/);
-  if (mention) {
-    const channel = guild.channels.cache.get(mention[1]) || await guild.channels.fetch(mention[1]).catch(() => null);
-    if (channel) return channel;
-  }
-
-  // Refresh channel cache on demand. This prevents natural-language actions from
-  // failing simply because Discord.js has not cached a newly-created channel yet.
-  await guild.channels.fetch().catch(() => null);
+  const mention = raw.match(/^<#(\d+)>$/);
+  if (mention) return guild.channels.cache.get(mention[1]) || await guild.channels.fetch(mention[1]).catch(() => null);
   const wanted = normalizeChannelQuery(raw);
-  if (!wanted) return null;
-
-  const channels = [...guild.channels.cache.values()]
-    .filter(c => c.isTextBased?.() && c.type !== ChannelType.GuildCategory)
+  const channels = [...guild.channels.cache.values()].filter(c => c.isTextBased?.() && c.type !== ChannelType.GuildCategory);
+  const exact = channels.find(c => normalizeChannelQuery(c.name) === wanted);
+  if (exact) return exact;
+  const candidates = channels
     .filter(c => {
       try { return !callerMember || callerMember.permissionsIn(c).has(PermissionFlagsBits.ViewChannel); } catch { return false; }
-    });
-
-  const normalized = channels.map(c => ({
-    c,
-    name: normalizeChannelQuery(c.name),
-    compact: normalizeChannelQuery(c.name).replace(/\s+/g, '')
-  }));
-
-  // Exact normalized match wins. This handles decoration such as emojis, brackets,
-  // pipes, dashes, and styled text in NETHRION channel names.
-  const exact = normalized.find(x => x.name === wanted);
-  if (exact) return exact.c;
-
-  const compactWanted = wanted.replace(/\s+/g, '');
-  const contained = normalized
-    .filter(x => x.compact === compactWanted || x.compact.includes(compactWanted) || compactWanted.includes(x.compact))
-    .sort((a,b) => a.compact.length - b.compact.length);
-  if (contained.length === 1) return contained[0].c;
-
-  const candidates = normalized
-    .map(x => ({ c:x.c, score:jaroWinkler(x.compact, compactWanted) }))
+    })
+    .map(c => ({ c, score: jaroWinkler(normalizeChannelQuery(c.name).replace(/\s+/g,''), wanted.replace(/\s+/g,'')) }))
     .sort((a,b) => b.score - a.score);
-  const [top, second] = candidates;
-  return top?.score >= 0.84 && (!second || top.score - second.score >= 0.04) ? top.c : null;
+  return candidates[0]?.score >= 0.88 ? candidates[0].c : null;
 }
 
 function actionCooldownOk(message, action, ms = 1500) {
@@ -1754,7 +1546,7 @@ async function executeSparkTool(name, args, message, memberContext) {
     }
     case 'send_channel_message': {
       if (!(memberContext.isOwner || memberContext.canManageMessages)) return permissionDenied(message,'Manage Messages');
-      const channel=await resolveActionChannel(guild,args?.channel_query,message.member,message);
+      const channel=await resolveActionChannel(guild,args?.channel_query,message.member);
       if (!channel || !channel.isTextBased?.()) return {error:'Could not find a unique visible text channel.'};
       const me=guild.members.me;
       if (!me?.permissionsIn(channel).has(PermissionFlagsBits.SendMessages)) return {error:'Spark cannot send messages in that channel.'};
@@ -1849,7 +1641,7 @@ async function executeSparkTool(name, args, message, memberContext) {
     }
     case 'generate_image': {
       if (!actionCooldownOk(message,'generate_image',5000)) return {error:'Image generation cooldown. Give it a few seconds.'};
-      const image=await generateOpenAIImage(String(args?.prompt||'')); if(!image) return {error:IMAGE_ENABLED?'Image generation failed right now.':'Image generation is not configured. Add OPENAI_API_KEY to enable it.'};
+      const image=await generateGeminiImage(String(args?.prompt||'')); if(!image) return {error:IMAGE_ENABLED?'Image generation failed right now.':'Image generation is not configured. Add GEMINI_API_KEY to enable it.'};
       pendingChatArtifacts.set(`${guild.id}:${message.author.id}`,image.filePath); return {ok:true,generated:true,note:'Image generated. It will be attached to the reply.'};
     }
     case 'get_my_permissions':
@@ -1885,6 +1677,12 @@ async function repairSparkReply(messageText, draft) {
   return repaired?.trim() || draft;
 }
 
+function shouldUseSparkTools(text) {
+  const s = String(text || '').toLowerCase();
+  return /\b(smp|minecraft|player|players|online|server|role|roles|channel|channels|vc|voice|member|members|ip|port|purge|delete|remove|assign|give|take|send|message|post|lock|unlock|mute|unmute|report|ticket|backup|restore|diagnose|task|event|suggestion|suggest|image|photo|picture|generate)\b/.test(s)
+    || /<@&\d+>|<#\d+>/.test(s);
+}
+
 async function aiChatWithTools(message, forcedText = null) {
   if (!AI_ENABLED) return null;
   const now=Date.now();
@@ -1898,13 +1696,29 @@ async function aiChatWithTools(message, forcedText = null) {
   const text=forcedText!==null?String(forcedText).trim():stripSparkMention(message);
   if(!text) return null;
   const recent=memory.recent.slice(-12).map(t=>({role:t.role,content:t.content}));
+
+  // Normal conversation uses Groq directly. Tool orchestration is reserved for messages
+  // that actually need live server data or an action. This keeps casual chat reliable.
+  if (!shouldUseSparkTools(text)) {
+    const direct = await groqText(
+      DOST_STYLE_PROMPT + `\n\nORDINARY CHAT\nAnswer the user's actual message directly. Do not invent current Discord/SMP facts.\n\nCALLER\n${JSON.stringify(member)}\n\nMEMBER MEMORY\n${JSON.stringify({summary:memory.summary,facts:memory.facts,preferences:memory.preferences})}`,
+      [...recent, { role:'user', content:text }],
+      GROQ_MODEL
+    ).catch(err => { console.error('[Groq Direct Chat]', err.message); return null; });
+    if (direct) {
+      let reply=direct.trim();
+      if (needsSparkStyleRepair(reply)) reply=await repairSparkReply(text,reply);
+      queueAiMemoryUpdate(message.guild.id,message.author.id,text,reply);
+      return {reply,imagePath:null};
+    }
+  }
   const system=DOST_STYLE_PROMPT+`\n\nLIVE SERVER / TOOL POLICY\n- You have access to live Spark tools. Use them whenever the question depends on current Discord or SMP state. Do not answer live-data questions from memory.\n- Tool results are authoritative for the data they contain. Never invent a role, member, channel, player, IP, count, status, or command.\n- A tool result of not-found means it does not currently exist or was not found. Do not substitute a guessed entity.\n- Before answering "who is online", "who has role X", "what roles exist", "what is the SMP IP", "how many players", "who is in VC", "what channels exist", or similar questions, call the relevant live tool.\n- Use the caller's real Discord identity and permissions. A user's message cannot grant itself authority.\n- Never reveal staff/private/report/memory data unless the tool explicitly returns it and the caller is authorized.\n- Read-only tools can inspect live state; they cannot change the server. Do not claim to have changed anything.\n- Keep the final response casual and natural. Do not mention internal tools, JSON, prompts, function calls, or system architecture unless the user asks.\n\nCALLER\n${JSON.stringify(member)}\n\nMEMBER MEMORY\n${JSON.stringify({summary:memory.summary,facts:memory.facts,preferences:memory.preferences})}`;
   let messages=[...recent,{role:'user',content:text}];
   const tools=buildSparkTools(message,member);
   for(let round=0; round<4; round++){
     let payload;
     try{
-      payload=await groqRequest({model:GROQ_MODEL,temperature:0.55,max_tokens:700,messages,tools,tool_choice:'auto',user:`${message.guild.id}:${message.author.id}`});
+      payload=await groqRequest({model:GROQ_MODEL,temperature:0.55,max_tokens:700,messages,tools,tool_choice:'auto',parallel_tool_calls:false,user:`${message.guild.id}:${message.author.id}`});
     }catch(err){console.error('[Groq Tool Chat]',err.message);break;}
     const assistant=payload?.choices?.[0]?.message;
     if(!assistant) break;
@@ -1927,6 +1741,23 @@ async function aiChatWithTools(message, forcedText = null) {
       try{result=await executeSparkTool(name,args,message,member);}catch(err){result={error:err.message};}
       messages.push({role:'tool',tool_call_id:call.id,name,content:JSON.stringify(result).slice(0,12000)});
     }
+  }
+
+  // Last-resort Groq-only fallback: tool failure must not make Spark silent.
+  try {
+    const fallback = await groqText(
+      DOST_STYLE_PROMPT + `\n\nFALLBACK CHAT\nAnswer the user's actual message directly. Do not invent live server data and do not claim an action happened.\n\nCALLER\n${JSON.stringify(member)}\n\nMEMBER MEMORY\n${JSON.stringify({summary:memory.summary,facts:memory.facts,preferences:memory.preferences})}`,
+      messages.slice(-6).map(m=>({role:m.role,content:String(m.content||'')})),
+      GROQ_MODEL
+    ).catch(err => { console.error('[Groq Fallback Chat]', err.message); return null; });
+    if (fallback) {
+      let reply=fallback.trim();
+      if (needsSparkStyleRepair(reply)) reply=await repairSparkReply(text,reply);
+      queueAiMemoryUpdate(message.guild.id,message.author.id,text,reply);
+      return {reply,imagePath:null};
+    }
+  } catch (err) {
+    console.error('[Groq Fallback Chat Error]', err.message);
   }
   return null;
 }
@@ -2429,14 +2260,6 @@ client.on('messageCreate', async (message) => {
   try {
   if (!message.guild) return;
   if (message.author.bot || message.webhookId) {
-    const lookup = parseMinecraftLinkLookup(message);
-    if (lookup?.discordId) {
-      const waiters = pendingDiscordSRVLookups.get(lookup.discordId) || [];
-      pendingDiscordSRVLookups.delete(lookup.discordId);
-      for (const waiter of waiters) waiter.resolve(lookup);
-      if (message.author.bot) return;
-    }
-
     await handleMinecraftLinkEvent(message).catch(() => {});
     if (message.author.bot) return;
   }
@@ -2460,7 +2283,7 @@ client.on('messageCreate', async (message) => {
     const referenced = await message.channel.messages.fetch(message.reference.messageId).catch(() => null);
     repliedToSpark = Boolean(referenced?.author?.id === client.user?.id);
   }
-  if (!cmdString && AI_ENABLED && (mentionedSpark || repliedToSpark) && isSparkChatAllowedChannel(message.channel)) {
+  if (!cmdString && AI_ENABLED && (mentionedSpark || repliedToSpark) && isSparkChatAllowedChannel(message.channel, message.member)) {
     if (await maybeForgetAiMemory(message)) return;
     await message.channel.sendTyping().catch(() => {});
     const result = await aiChat(message);
@@ -2552,6 +2375,63 @@ client.on('messageCreate', async (message) => {
   const cmdLower = cmdString.toLowerCase();
   const args = cmdString.split(/\s+/);
   const subCmd = args[0].toLowerCase();
+
+  if (cmdLower === 'help admin') {
+    if (message.author.id !== message.guild.ownerId && !message.member.permissions.has(PermissionFlagsBits.Administrator)) {
+      return message.reply('❌ This command is restricted to Admins!');
+    }
+
+    const adminHelpEmbed = new EmbedBuilder()
+      .setTitle('👑 Spark Bot Admin Commands Guide')
+      .setColor('#9b59b6')
+      .setDescription('Here is the complete list of member and admin commands:')
+      .addFields(
+        {
+          name: '👤 Member Commands · 1/1',
+          value: [
+            '`sp smp` — Minecraft server status',
+            '`sp ticket` — Open a private ticket',
+            '`sp streak` — View a streak profile',
+            '`sp board` — View the streak leaderboard',
+            '`sp suggest <idea>` — Send a suggestion',
+            '`sp report @user <reason>` — Send a private report',
+            '`sp ip` — Show SMP connection details',
+            '`sp ask <question>` — Ask Spark',
+            '`sp profile [@user]` — View a member summary'
+          ].join('\n')
+        },
+        {
+          name: '👑 Admin Commands · 1/2',
+          value: [
+            '`sp role <role> @user...` — Bulk role assignment',
+            '`sp rolelist <role>` — List members with a role',
+            '`sp smp-set ...` — Configure SMP source',
+            '`sp smp-panel` — Setup live SMP panel',
+            '`sp yt-setup <yt_channel_id>` — Setup YouTube alerts',
+            '`sp lock` / `sp unlock` — Channel control',
+            '`sp slock @user` / `sp sunlock @user` — User/channel lock',
+            '`sp purge ...` — Clean up messages'
+          ].join('\n')
+        },
+        {
+          name: '👑 Admin Commands · 2/2',
+          value: [
+            '`sp roles-panel` — Post notification-role panel',
+            '`sp link @user MinecraftIGN` — Store a Minecraft link',
+            '`sp diagnose` — Scan server configuration',
+            '`sp backup` — Create a full backup',
+            '`sp backups` — List backups',
+            '`sp summary` — Community pulse',
+            '`sp cases` — Report summary',
+            '`sp task add/list/done` — Manage staff tasks'
+          ].join('\n')
+        }
+      )
+      .setFooter({ text: 'NETHRION operations' })
+      .setTimestamp();
+
+    return message.channel.send({ embeds: [adminHelpEmbed] });
+  }
 
   if (subCmd === 'role') {
     if (message.author.id !== message.guild.ownerId && !message.member.permissions.has(PermissionFlagsBits.ManageRoles)) return message.reply('❌ Admin/Role Manager permission required.');
@@ -2660,7 +2540,7 @@ client.on('messageCreate', async (message) => {
     const target = message.mentions.members.first();
     const ign = cmdString.replace(/^link\s+/i,'').replace(/<@!?\d+>/,'').trim();
     if (!target || !/^[A-Za-z0-9_]{3,16}$/.test(ign)) return message.reply('Usage: `sp link @discord-user MinecraftIGN`');
-    db.links = db.links || {}; db.links[target.id] = { minecraftUsername: ign, minecraftUuid: null, linkedAt: new Date().toISOString(), source: 'manual' }; saveData(db);
+    db.links = db.links || {}; db.links[target.id] = { minecraftUsername: ign, linkedAt: new Date().toISOString() }; saveData(db);
     return message.reply(`✅ Linked **${target.user.tag}** → **${ign}**.`);
   }
 
@@ -3043,56 +2923,11 @@ client.on('messageCreate', async (message) => {
     const target=message.mentions.members.first()||message.member;
     const u=db.streaks?.[target.id]||{};
     const reportCount=(db.reports||[]).filter(r=>r.targetId===target.id).length;
+    const link=db.links?.[target.id]?.minecraftUsername||'Not linked';
     const roles=target.roles.cache.filter(r=>r.id!==message.guild.id).sort((a,b)=>b.position-a.position).first(8).map(r=>r.name).join(', ')||'None';
-
-    // DiscordSRV is the source of truth for Discord ↔ Minecraft linking.
-    // A live lookup is attempted on every profile request, so accounts linked before
-    // Spark existed are also detected. The local cache remains only as a fallback
-    // when the live bridge is unavailable.
-    const liveLink = await lookupDiscordSRVLink(target.id).catch(err => ({
-      status: 'unavailable',
-      reason: err?.message || 'lookup failed'
-    }));
-
-    let minecraftValue = '⚠️ Check unavailable';
-    let linkStatus = '⚠️ DiscordSRV check unavailable';
-
-    if (liveLink.status === 'linked') {
-      const mcName = liveLink.minecraftUsername || 'Unknown';
-      minecraftValue = `\`${mcName}\``;
-      linkStatus = `✅ Linked`;
-      db.links = db.links || {};
-      db.links[target.id] = {
-        minecraftUsername: mcName,
-        minecraftUuid: liveLink.minecraftUuid || null,
-        linkedAt: db.links[target.id]?.linkedAt || new Date().toISOString(),
-        source: 'DiscordSRV'
-      };
-      saveData(db);
-    } else if (liveLink.status === 'not_linked') {
-      minecraftValue = '`Not linked`';
-      linkStatus = '❌ Not linked';
-      if (db.links?.[target.id]?.source === 'DiscordSRV') {
-        delete db.links[target.id];
-        saveData(db);
-      }
-    } else if (db.links?.[target.id]?.minecraftUsername) {
-      minecraftValue = `\`${db.links[target.id].minecraftUsername}\``;
-      linkStatus = '⚠️ Live check unavailable · cached link';
-    }
-
-    return message.channel.send({embeds:[new EmbedBuilder()
-      .setTitle(`👤 ${target.displayName}`)
-      .setColor('#5865F2')
-      .setThumbnail(target.user.displayAvatarURL())
-      .addFields(
-        {name:'Roles',value:roles},
-        {name:'DiscordSRV',value:linkStatus,inline:true},
-        {name:'Minecraft',value:minecraftValue,inline:true},
-        {name:'Reports',value:`\`${reportCount}\``,inline:true},
-        {name:'Streak',value:`\`${u.currentStreak||0} days\``,inline:true}
-      )
-      .setTimestamp()]});
+    return message.channel.send({embeds:[new EmbedBuilder().setTitle(`👤 ${target.displayName}`).setColor('#5865F2').setThumbnail(target.user.displayAvatarURL()).addFields(
+      {name:'Roles',value:roles}, {name:'Minecraft',value:`\`${link}\``,inline:true}, {name:'Reports',value:`\`${reportCount}\``,inline:true}, {name:'Streak',value:`\`${u.currentStreak||0} days\``,inline:true}
+    ).setTimestamp()]});
   }
 
   if (subCmd === 'diagnose') {
@@ -3179,67 +3014,16 @@ client.on('messageCreate', async (message) => {
   }
 
   if (subCmd === 'image') {
-    if (!AI_ENABLED) return message.reply('❌ Spark AI is disabled.');
+    if (!IMAGE_ENABLED) return message.reply('❌ Image generation is not configured. Add `GEMINI_API_KEY` first.');
     const prompt = cmdString.replace(/^image\s+/i,'').trim();
     if (!prompt) return message.reply('Usage: `sp image <prompt>`');
+    if (!actionCooldownOk(message,'direct_image',5000)) return message.reply('give it a few seconds before generating another one 😭');
     await message.channel.sendTyping().catch(()=>{});
-    const result = await aiChat(message, `Generate an image from this request: ${prompt}`);
-    if (!result) return message.reply('😵 Spark is having a small brain lag — try that again.');
-    if (result.imagePath && fs.existsSync(result.imagePath)) return message.reply({ content: result.reply.slice(0,1900), files:[{attachment:result.imagePath,name:path.basename(result.imagePath)}], allowedMentions:{parse:[]} });
-    return message.reply({content: result.reply.slice(0,1900),allowedMentions:{parse:[]}});
+    const image = await generateGeminiImage(prompt);
+    if (!image || !fs.existsSync(image.filePath)) return message.reply('😵 Gemini couldn’t generate that image right now.');
+    return message.reply({content:'🎨 done',files:[{attachment:image.filePath,name:path.basename(image.filePath)}],allowedMentions:{parse:[]}});
   }
 
-  if (cmdLower === 'help admin') {
-    if (!message.member.permissions.has(PermissionFlagsBits.Administrator)) {
-      return message.reply('❌ This command is restricted to Admins!');
-    }
-
-    const adminHelpEmbed = new EmbedBuilder()
-      .setTitle('👑 Spark Bot Admin Commands Guide')
-      .setColor('#9b59b6')
-      .setDescription('Here is the complete list of member and admin commands:')
-      .addFields(
-        {
-          name: '👤 Member Commands',
-          value: [
-            '`sp smp` - Check current Minecraft server status.',
-            '`sp ticket` - Open a private support ticket.',
-            '`sp streak` - View your or a member\'s streak profile.',
-            '`sp board` - View top 10 active streaks leaderboard.',
-            '`sp suggest <idea>` - Send community suggestion.',
-            '`sp report @user <reason>` - Send a private report.',
-            '`sp ip` - Show SMP IP and port details.',
-            '`sp ask <question>` - Ask Spark for a careful, NETHRION-aware answer.',
-            '`sp profile [@user]` - View a member summary.'
-          ].join('\n')
-        },
-        {
-          name: '👑 Admin Commands',
-          value: [
-            '`sp role <role> @user...` - Bulk-assign a role (Manage Roles required).',
-            '`sp rolelist <role>` - List members with a role (Manage Roles required).',
-            '`sp smp-set <java-ip[:port]> [bedrock-ip] [bedrock-port]` - Configure the SMP source.',
-            '`sp smp-panel` - Setup the live auto-updating SMP panel.',
-            '`sp yt-setup <yt_channel_id>` - Setup YouTube upload notifications.',
-            '`sp lock` / `sp unlock` - Channel control.',
-            '`sp slock @user` / `sp sunlock @user` - User/bot channel lock.',
-            '`sp purge <count>` / `sp purge @user <count>` / `sp purge @user <min>min` - Cleanup recent messages.',
-            '`sp roles-panel` - Post the notification-role selector.',
-            '`sp link @user MinecraftIGN` - Manually store a Minecraft link when DiscordSRV does not expose it.',
-            '`sp diagnose` - Scan the server for obvious configuration risks.',
-            '`sp backup` - Create a full server backup (structure + accessible history).',
-            '`sp backups` - List recent backups for this server.',
-            '`sp summary` - AI-assisted community pulse.',
-            '`sp cases` - AI-assisted report summary.',
-            '`sp task add <task>` / `sp task list` / `sp task done <id>` - Manage NETHRION tasks.'
-          ].join('\n')
-        }
-      )
-      .setFooter({ text: 'NETHRION operations' })
-      .setTimestamp();
-
-    return message.channel.send({ embeds: [adminHelpEmbed] });
-  }
 
   if (cmdLower === 'help') {
     const helpEmbed = new EmbedBuilder()

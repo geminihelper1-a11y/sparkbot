@@ -1278,10 +1278,14 @@ function getPublicGuildSnapshot(guild, member = null) {
   return { id:guild.id, name:guild.name, memberCount:guild.memberCount, roles:roleList, channels };
 }
 
-function isSparkChatAllowedChannel(channel) {
+function isSparkChatAllowedChannel(channel, member = null) {
   const n = String(channel?.name || '').toLowerCase();
   if (!channel || !channel.isTextBased?.()) return false;
-  return !/(report|admin|staff|bot-testing|bot-commands|anon-log|ticket)/i.test(n);
+  if (/bot-testing/i.test(n)) {
+    // Allow owners/admins to test Spark in the dedicated bot-testing channel.
+    return Boolean(member && (member.id === channel.guild?.ownerId || member.permissions?.has?.(PermissionFlagsBits.Administrator)));
+  }
+  return !/(report|admin|staff|bot-commands|anon-log|ticket)/i.test(n);
 }
 
 function stripSparkMention(message) {
@@ -2279,7 +2283,7 @@ client.on('messageCreate', async (message) => {
     const referenced = await message.channel.messages.fetch(message.reference.messageId).catch(() => null);
     repliedToSpark = Boolean(referenced?.author?.id === client.user?.id);
   }
-  if (!cmdString && AI_ENABLED && (mentionedSpark || repliedToSpark) && isSparkChatAllowedChannel(message.channel)) {
+  if (!cmdString && AI_ENABLED && (mentionedSpark || repliedToSpark) && isSparkChatAllowedChannel(message.channel, message.member)) {
     if (await maybeForgetAiMemory(message)) return;
     await message.channel.sendTyping().catch(() => {});
     const result = await aiChat(message);
@@ -2383,38 +2387,43 @@ client.on('messageCreate', async (message) => {
       .setDescription('Here is the complete list of member and admin commands:')
       .addFields(
         {
-          name: '👤 Member Commands',
+          name: '👤 Member Commands · 1/1',
           value: [
-            '`sp smp` - Check current Minecraft server status.',
-            '`sp ticket` - Open a private support ticket.',
-            '`sp streak` - View your or a member\'s streak profile.',
-            '`sp board` - View top 10 active streaks leaderboard.',
-            '`sp suggest <idea>` - Send community suggestion.',
-            '`sp report @user <reason>` - Send a private report.',
-            '`sp ip` - Show SMP IP and port details.',
-            '`sp ask <question>` - Ask Spark for a careful, NETHRION-aware answer.',
-            '`sp profile [@user]` - View a member summary.'
+            '`sp smp` — Minecraft server status',
+            '`sp ticket` — Open a private ticket',
+            '`sp streak` — View a streak profile',
+            '`sp board` — View the streak leaderboard',
+            '`sp suggest <idea>` — Send a suggestion',
+            '`sp report @user <reason>` — Send a private report',
+            '`sp ip` — Show SMP connection details',
+            '`sp ask <question>` — Ask Spark',
+            '`sp profile [@user]` — View a member summary'
           ].join('\n')
         },
         {
-          name: '👑 Admin Commands',
+          name: '👑 Admin Commands · 1/2',
           value: [
-            '`sp role <role> @user...` - Bulk-assign a role (Manage Roles required).',
-            '`sp rolelist <role>` - List members with a role (Manage Roles required).',
-            '`sp smp-set <java-ip[:port]> [bedrock-ip] [bedrock-port]` - Configure the SMP source.',
-            '`sp smp-panel` - Setup the live auto-updating SMP panel.',
-            '`sp yt-setup <yt_channel_id>` - Setup YouTube upload notifications.',
-            '`sp lock` / `sp unlock` - Channel control.',
-            '`sp slock @user` / `sp sunlock @user` - User/bot channel lock.',
-            '`sp purge <count>` / `sp purge @user <count>` / `sp purge @user <min>min` - Cleanup recent messages.',
-            '`sp roles-panel` - Post the notification-role selector.',
-            '`sp link @user MinecraftIGN` - Manually store a Minecraft link when DiscordSRV does not expose it.',
-            '`sp diagnose` - Scan the server for obvious configuration risks.',
-            '`sp backup` - Create a full server backup (structure + accessible history).',
-            '`sp backups` - List recent backups for this server.',
-            '`sp summary` - AI-assisted community pulse.',
-            '`sp cases` - AI-assisted report summary.',
-            '`sp task add <task>` / `sp task list` / `sp task done <id>` - Manage NETHRION tasks.'
+            '`sp role <role> @user...` — Bulk role assignment',
+            '`sp rolelist <role>` — List members with a role',
+            '`sp smp-set ...` — Configure SMP source',
+            '`sp smp-panel` — Setup live SMP panel',
+            '`sp yt-setup <yt_channel_id>` — Setup YouTube alerts',
+            '`sp lock` / `sp unlock` — Channel control',
+            '`sp slock @user` / `sp sunlock @user` — User/channel lock',
+            '`sp purge ...` — Clean up messages'
+          ].join('\n')
+        },
+        {
+          name: '👑 Admin Commands · 2/2',
+          value: [
+            '`sp roles-panel` — Post notification-role panel',
+            '`sp link @user MinecraftIGN` — Store a Minecraft link',
+            '`sp diagnose` — Scan server configuration',
+            '`sp backup` — Create a full backup',
+            '`sp backups` — List backups',
+            '`sp summary` — Community pulse',
+            '`sp cases` — Report summary',
+            '`sp task add/list/done` — Manage staff tasks'
           ].join('\n')
         }
       )

@@ -1,26 +1,31 @@
 # Spark + DiscordSRV live profile lookup
 
-`sp profile @user` now asks DiscordSRV for the live link status every time. This is not limited to links created after Spark was installed.
+`sp profile @user` performs a live DiscordSRV lookup on every request. It also detects accounts that were linked before Spark existed.
 
-## 1) Keep the existing event bridge
+## 1) Spark environment variables
 
-Your existing `alerts.yml` linked/unlinked alerts can stay in place:
+Set these in Railway:
 
-```yaml
-- Trigger: github.scarsz.discordsrv.api.events.AccountLinkedEvent
-  Channel: linked
-  Content: "SPARK_LINK|event=linked|discord_id=${#event.getUser().getId()}|minecraft_uuid=${#event.getPlayer().getUniqueId()}|minecraft_username={username}"
-
-- Trigger: github.scarsz.discordsrv.api.events.AccountUnlinkedEvent
-  Channel: linked
-  Content: "SPARK_LINK|event=unlinked|discord_id=${#event.getDiscordUser().getId()}|minecraft_uuid=${#event.getPlayer().getUniqueId()}|minecraft_username={username}"
+```text
+DISCORDSRV_CONSOLE_CHANNEL_ID=<Discord channel ID of the DiscordSRV console channel>
+DISCORDSRV_CONSOLE_PREFIX=!c
+DISCORDSRV_LINK_EVENT_CHANNEL_ID=<Discord channel ID where the Spark lookup responses/links are sent>
+DISCORDSRV_BOT_ID=<DiscordSRV bot user ID>
 ```
 
-`linked` must be a configured DiscordSRV channel name. Set the matching Discord channel ID in Spark as `DISCORDSRV_LINK_EVENT_CHANNEL_ID`.
+Do not set the old `DISCORDSRV_RCON_*` variables; this build does not use RCON.
 
-## 2) Add a live lookup alert to DiscordSRV `alerts.yml`
+## 2) DiscordSRV config
 
-Put this under `Alerts:`:
+DiscordSRV must have a dedicated console channel configured with `DiscordConsoleChannelId`. Its Discord-to-console command feature must be enabled, and the prefix must match `DISCORDSRV_CONSOLE_PREFIX` (default `!c`).
+
+Allow the `discordsrv` command through the Discord console command whitelist. Keep the console channel private to your trusted staff/bot roles. DiscordSRV must also allow bot messages in the console channel for Spark's command to be processed.
+
+DiscordSRV's documentation states that the console channel executes messages as server commands, and that the console-command feature uses a configurable prefix and whitelist.
+
+## 3) alerts.yml
+
+Keep the existing link/unlink alerts and add the live lookup alert under the single top-level `Alerts:` list:
 
 ```yaml
   - Trigger: /discordsrv linked
@@ -30,53 +35,36 @@ Put this under `Alerts:`:
     Content: "SPARK_LOOKUP|discord_id=${#args.get(0)}|minecraft_uuid=${#discordsrv.accountLinkManager.getUuid(#args.get(0)) == null ? 'null' : #discordsrv.accountLinkManager.getUuid(#args.get(0))}|minecraft_username=${#discordsrv.accountLinkManager.getUuid(#args.get(0)) == null ? 'null' : #server.getOfflinePlayer(#discordsrv.accountLinkManager.getUuid(#args.get(0))).getName()}"
 ```
 
-This uses DiscordSRV's own account-link manager for the lookup. DiscordSRV's `linked` command supports a Discord ID target, and its command implementation uses `accountLinkManager.getUuid(target)` for that direction.
-
-If your server exposes the `/discord` alias rather than `/discordsrv` for alert triggering, add the same alert with:
-
-```yaml
-  - Trigger: /discord linked
-    Channel: linked
-    Conditions:
-      - '#sender.name == "CONSOLE"'
-    Content: "SPARK_LOOKUP|discord_id=${#args.get(0)}|minecraft_uuid=${#discordsrv.accountLinkManager.getUuid(#args.get(0)) == null ? 'null' : #discordsrv.accountLinkManager.getUuid(#args.get(0))}|minecraft_username=${#discordsrv.accountLinkManager.getUuid(#args.get(0)) == null ? 'null' : #server.getOfflinePlayer(#discordsrv.accountLinkManager.getUuid(#args.get(0))).getName()}"
-```
-
-## 3) Enable RCON on the Minecraft server
-
-Spark is running remotely on Railway, so it needs a secure way to ask the Minecraft server to perform the DiscordSRV lookup. Set these Railway variables:
-
-```text
-DISCORDSRV_RCON_HOST=<minecraft-server-host>
-DISCORDSRV_RCON_PORT=25575
-DISCORDSRV_RCON_PASSWORD=<strong-rcon-password>
-DISCORDSRV_LINK_EVENT_CHANNEL_ID=<discord-link-channel-id>
-DISCORDSRV_BOT_ID=<DiscordSRV-bot-user-id>
-```
-
-Use the actual RCON port/password configured by your Minecraft host.
+Here `linked` is the DiscordSRV channel name, not the visible Discord channel name. It must resolve to the Discord channel whose ID is in `DISCORDSRV_LINK_EVENT_CHANNEL_ID`.
 
 ## Result
 
-Now:
+When Spark receives:
 
 ```text
 sp profile @User
 ```
 
-does a live DiscordSRV lookup.
+it sends the Discord console command:
+
+```text
+!c discordsrv linked <DiscordID>
+```
+
+DiscordSRV executes the command, the command alert emits `SPARK_LOOKUP`, and Spark displays the live result.
 
 Linked:
+
 ```text
 DiscordSRV  ✅ Linked
 Minecraft    `PlayerName`
 ```
 
 Not linked:
+
 ```text
 DiscordSRV  ❌ Not linked
 Minecraft    `Not linked`
 ```
 
-If the live bridge is unreachable, Spark does not pretend the user is unlinked; it shows that the DiscordSRV check is unavailable and may show a cached link as a fallback.
-
+This live path is independent of Spark's local link database, so pre-existing DiscordSRV links are detected too.

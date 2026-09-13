@@ -18,7 +18,6 @@ const {
 const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
-const net = require('net');
 require('dotenv').config();
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
@@ -48,6 +47,7 @@ const aiCooldowns = new Map();
 const securityBurst = new Map();
 const pendingDiscordSRVLookups = new Map();
 
+// DiscordSRV live-link lookups use the Discord console bridge; no RCON is required.
 // NETHRION SMP defaults; `sp smp-set` overrides them per guild.
 const DEFAULT_SMP = {
   javaHost: 'nethrionsmp.pixelforge.gg',
@@ -323,96 +323,16 @@ function isValidDiscordId(value) {
   return /^\d{17,20}$/.test(String(value || '').trim());
 }
 
-function buildRconPacket(requestId, packetType, body) {
-  const bodyBuffer = Buffer.from(`${body}\0`, 'utf8');
-  const packetLength = 4 + 4 + bodyBuffer.length + 1;
-  const packet = Buffer.alloc(4 + packetLength);
-  packet.writeInt32LE(packetLength, 0);
-  packet.writeInt32LE(requestId, 4);
-  packet.writeInt32LE(packetType, 8);
-  bodyBuffer.copy(packet, 12);
-  return packet;
+function getDiscordSrvConsoleChannelId() {
+  return String(process.env.DISCORDSRV_CONSOLE_CHANNEL_ID || '').trim();
 }
 
-function executeMinecraftRcon(command, timeoutMs = 2500) {
-  const host = String(process.env.DISCORDSRV_RCON_HOST || '').trim();
-  const port = Number(process.env.DISCORDSRV_RCON_PORT || 25575);
-  const password = String(process.env.DISCORDSRV_RCON_PASSWORD || '');
-
-  if (!host || !password || !Number.isInteger(port) || port < 1 || port > 65535) {
-    return Promise.resolve({ ok: false, reason: 'RCON not configured' });
-  }
-
-  return new Promise((resolve) => {
-    const socket = new net.Socket();
-    let settled = false;
-    let authed = false;
-    let buffer = Buffer.alloc(0);
-    const authId = Math.floor(Math.random() * 0x3fffffff) + 1;
-    const execId = authId + 1;
-
-    const finish = (result) => {
-      if (settled) return;
-      settled = true;
-      socket.destroy();
-      resolve(result);
-    };
-
-    const timer = setTimeout(() => finish({ ok: authed, reason: authed ? 'timeout' : 'RCON connection timeout' }), timeoutMs);
-
-    const consumePackets = () => {
-      while (buffer.length >= 4) {
-        const length = buffer.readInt32LE(0);
-        if (length < 10 || length > 10 * 1024 * 1024) {
-          clearTimeout(timer);
-          return finish({ ok: false, reason: 'Invalid RCON packet' });
-        }
-        if (buffer.length < length + 4) return;
-        const packet = buffer.subarray(4, length + 4);
-        const requestId = packet.readInt32LE(0);
-        const packetType = packet.readInt32LE(4);
-        const nul = packet.indexOf(0, 8);
-        const body = nul >= 0 ? packet.subarray(8, nul).toString('utf8') : '';
-        buffer = buffer.subarray(length + 4);
-
-        if (!authed && (packetType === 2 || requestId === authId)) {
-          if (requestId === -1) return finish({ ok: false, reason: 'RCON authentication failed' });
-          authed = true;
-          socket.write(buildRconPacket(execId, 2, command));
-          // DiscordSRV's /discordsrv linked command performs its lookup asynchronously.
-          // We only need to know that the command was accepted; the machine-readable
-          // result arrives through the DiscordSRV alerts bridge.
-          setTimeout(() => finish({ ok: true, response: body }), 350);
-          return;
-        }
-      }
-    };
-
-    socket.on('data', (chunk) => {
-      buffer = Buffer.concat([buffer, chunk]);
-      consumePackets();
-    });
-    socket.on('error', (err) => {
-      clearTimeout(timer);
-      finish({ ok: false, reason: err.message });
-    });
-    socket.on('close', () => {
-      clearTimeout(timer);
-      if (!settled) finish({ ok: authed, reason: authed ? 'RCON closed' : 'RCON closed before authentication' });
-    });
-
-    socket.setTimeout(timeoutMs, () => {
-      clearTimeout(timer);
-      finish({ ok: authed, reason: authed ? 'RCON socket timeout' : 'RCON socket timeout' });
-    });
-
-    socket.connect(port, host, () => {
-      socket.write(buildRconPacket(authId, 3, password));
-    });
-  });
+function getDiscordSrvConsolePrefix() {
+  const prefix = String(process.env.DISCORDSRV_CONSOLE_PREFIX || '!c').trim();
+  return prefix || '!c';
 }
 
-function registerDiscordSrvLookup(discordId, timeoutMs = 6000) {
+function registerDiscordSrvLookup(discordId, timeoutMs = 8000) {
   const key = String(discordId);
   return new Promise((resolve) => {
     const list = pendingDiscordSRVLookups.get(key) || [];
@@ -466,30 +386,43 @@ function parseMinecraftLinkLookup(message) {
 }
 
 async function lookupDiscordSRVLink(discordId) {
-  if (!isValidDiscordId(discordId)) return { status: 'unavailable', reason: 'invalid Discord ID' };
+  if (!isValidDiscordId(discordId)) {
+    return { status: 'unavailable', reason: 'invalid Discord ID' };
+  }
 
-  const channelId = getDiscordSrvLookupChannelId();
-  const rconHost = String(process.env.DISCORDSRV_RCON_HOST || '').trim();
-  const rconPassword = String(process.env.DISCORDSRV_RCON_PASSWORD || '');
+  const consoleChannelId = getDiscordSrvConsoleChannelId();
+  const lookupChannelId = getDiscordSrvLookupChannelId();
 
-  if (!channelId) return { status: 'unavailable', reason: 'DISCORDSRV_LINK_EVENT_CHANNEL_ID is not configured' };
-  if (!rconHost || !rconPassword) return { status: 'unavailable', reason: 'DiscordSRV RCON is not configured' };
+  if (!consoleChannelId) {
+    return { status: 'unavailable', reason: 'DISCORDSRV_CONSOLE_CHANNEL_ID is not configured' };
+  }
+
+  if (!lookupChannelId) {
+    return { status: 'unavailable', reason: 'DISCORDSRV_LINK_EVENT_CHANNEL_ID is not configured' };
+  }
+
+  const channel = await client.channels.fetch(consoleChannelId).catch(() => null);
+  if (!channel || !channel.isTextBased() || typeof channel.send !== 'function') {
+    return { status: 'unavailable', reason: 'DiscordSRV console channel is unavailable to Spark' };
+  }
 
   const requestedAt = Date.now();
-  const resultPromise = registerDiscordSrvLookup(discordId, 6000);
-  const rcon = await executeMinecraftRcon(`discordsrv linked ${discordId}`);
-  if (!rcon.ok) {
-    // We still wait briefly in case the server accepted the command just before the socket closed.
-    const lateResult = await Promise.race([
-      resultPromise,
-      new Promise(resolve => setTimeout(() => resolve(null), 1200))
-    ]);
-    if (lateResult && lateResult.createdAt >= requestedAt) {
-      return lateResult.minecraftUsername
-        ? { status: 'linked', ...lateResult }
-        : { status: 'not_linked', ...lateResult };
+  const resultPromise = registerDiscordSrvLookup(discordId, 8000);
+  const command = `${getDiscordSrvConsolePrefix()} discordsrv linked ${discordId}`;
+
+  const sent = await channel.send({
+    content: command,
+    allowedMentions: { parse: [] }
+  }).catch(() => null);
+
+  if (!sent) {
+    const waiters = pendingDiscordSRVLookups.get(String(discordId)) || [];
+    pendingDiscordSRVLookups.delete(String(discordId));
+    for (const waiter of waiters) {
+      clearTimeout(waiter.timer);
+      waiter.resolve(null);
     }
-    return { status: 'unavailable', reason: rcon.reason || 'RCON command failed' };
+    return { status: 'unavailable', reason: 'Could not send lookup command to DiscordSRV console channel' };
   }
 
   const result = await resultPromise;

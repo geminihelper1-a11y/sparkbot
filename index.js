@@ -1342,7 +1342,7 @@ function buildSparkTools(message, memberContext) {
   if (can.manageMessages) {
     tools.push(
       { type:'function', function:{ name:'purge_messages', description:'ACTUALLY delete recent messages from the CURRENT channel. Only call for an explicit delete/purge request. 1-20 can execute directly; above 20 requires the user to explicitly include/confirm the word confirm in the same request.', parameters:{type:'object',properties:{count:{type:'integer',minimum:1,maximum:100},confirm:{type:'boolean'}},required:['count','confirm'],additionalProperties:false} } },
-      { type:'function', function:{ name:'send_channel_message', description:'ACTUALLY send a message to an existing visible text channel. Only call for an explicit request to post/send/write a message. Requires Manage Messages or server owner. Never ping @everyone/@here automatically.', parameters:{type:'object',properties:{channel_query:{type:'string'},content:{type:'string',minLength:1,maxLength:1900}},required:['channel_query','content'],additionalProperties:false} } }
+      { type:'function', function:{ name:'send_channel_message', description:'ACTUALLY send a message to an existing visible text channel. Only call for an explicit request to post/send/write a message. Requires Manage Messages or server owner. If the user\'s message contains a Discord channel mention, use that exact mentioned channel; decoration or naming style must never make a real channel undiscoverable. Never ping @everyone/@here automatically.', parameters:{type:'object',properties:{channel_query:{type:'string'},content:{type:'string',minLength:1,maxLength:1900}},required:['channel_query','content'],additionalProperties:false} } }
     );
   }
   if (can.manageGuild) {
@@ -1386,24 +1386,63 @@ function findMentionedUserId(message, text) {
 }
 
 function normalizeChannelQuery(value) {
-  return normalizeSearchText(String(value || '').replace(/^<#(\d+)>$/, '').trim());
+  let raw = String(value || '').trim();
+  raw = raw.replace(/^<#(\d+)>$/, '$1');
+  // Remove a leading # used in natural language, while keeping real Discord mentions intact.
+  raw = raw.replace(/^#\s*/, '');
+  return normalizeSearchText(raw);
 }
 
-async function resolveActionChannel(guild, query, callerMember = null) {
+async function resolveActionChannel(guild, query, callerMember = null, message = null) {
+  // If the user actually mentioned a channel, that Discord ID is authoritative.
+  const mentioned = message?.mentions?.channels?.first?.();
+  if (mentioned) {
+    try {
+      if (!callerMember || callerMember.permissionsIn(mentioned).has(PermissionFlagsBits.ViewChannel)) return mentioned;
+    } catch {}
+  }
+
   const raw = String(query || '').trim();
-  const mention = raw.match(/^<#(\d+)>$/);
-  if (mention) return guild.channels.cache.get(mention[1]) || await guild.channels.fetch(mention[1]).catch(() => null);
+  const mention = raw.match(/<#(\d+)>/);
+  if (mention) {
+    const channel = guild.channels.cache.get(mention[1]) || await guild.channels.fetch(mention[1]).catch(() => null);
+    if (channel) return channel;
+  }
+
+  // Refresh channel cache on demand. This prevents natural-language actions from
+  // failing simply because Discord.js has not cached a newly-created channel yet.
+  await guild.channels.fetch().catch(() => null);
   const wanted = normalizeChannelQuery(raw);
-  const channels = [...guild.channels.cache.values()].filter(c => c.isTextBased?.() && c.type !== ChannelType.GuildCategory);
-  const exact = channels.find(c => normalizeChannelQuery(c.name) === wanted);
-  if (exact) return exact;
-  const candidates = channels
+  if (!wanted) return null;
+
+  const channels = [...guild.channels.cache.values()]
+    .filter(c => c.isTextBased?.() && c.type !== ChannelType.GuildCategory)
     .filter(c => {
       try { return !callerMember || callerMember.permissionsIn(c).has(PermissionFlagsBits.ViewChannel); } catch { return false; }
-    })
-    .map(c => ({ c, score: jaroWinkler(normalizeChannelQuery(c.name).replace(/\s+/g,''), wanted.replace(/\s+/g,'')) }))
+    });
+
+  const normalized = channels.map(c => ({
+    c,
+    name: normalizeChannelQuery(c.name),
+    compact: normalizeChannelQuery(c.name).replace(/\s+/g, '')
+  }));
+
+  // Exact normalized match wins. This handles decoration such as emojis, brackets,
+  // pipes, dashes, and styled text in NETHRION channel names.
+  const exact = normalized.find(x => x.name === wanted);
+  if (exact) return exact.c;
+
+  const compactWanted = wanted.replace(/\s+/g, '');
+  const contained = normalized
+    .filter(x => x.compact === compactWanted || x.compact.includes(compactWanted) || compactWanted.includes(x.compact))
+    .sort((a,b) => a.compact.length - b.compact.length);
+  if (contained.length === 1) return contained[0].c;
+
+  const candidates = normalized
+    .map(x => ({ c:x.c, score:jaroWinkler(x.compact, compactWanted) }))
     .sort((a,b) => b.score - a.score);
-  return candidates[0]?.score >= 0.88 ? candidates[0].c : null;
+  const [top, second] = candidates;
+  return top?.score >= 0.84 && (!second || top.score - second.score >= 0.04) ? top.c : null;
 }
 
 function actionCooldownOk(message, action, ms = 1500) {
@@ -1531,7 +1570,7 @@ async function executeSparkTool(name, args, message, memberContext) {
     }
     case 'send_channel_message': {
       if (!(memberContext.isOwner || memberContext.canManageMessages)) return permissionDenied(message,'Manage Messages');
-      const channel=await resolveActionChannel(guild,args?.channel_query,message.member);
+      const channel=await resolveActionChannel(guild,args?.channel_query,message.member,message);
       if (!channel || !channel.isTextBased?.()) return {error:'Could not find a unique visible text channel.'};
       const me=guild.members.me;
       if (!me?.permissionsIn(channel).has(PermissionFlagsBits.SendMessages)) return {error:'Spark cannot send messages in that channel.'};

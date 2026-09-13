@@ -1,6 +1,6 @@
 {
   "name": "spark-bot",
-  "version": "2.3.0",
+  "version": "2.4.0-chat",
   "description": "NETHRION all-in-one Discord community and Minecraft operations bot",
   "main": "index.js",
   "scripts": {

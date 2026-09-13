@@ -1,6 +1,6 @@
 {
   "name": "spark-bot",
-  "version": "2.5.1-gemini-image",
+  "version": "2.5.0-natural-actions",
   "description": "NETHRION all-in-one Discord community and Minecraft operations bot",
   "main": "index.js",
   "scripts": {

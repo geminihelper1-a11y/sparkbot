@@ -19,6 +19,7 @@ const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
 require('dotenv').config();
+const { toolDefs: allBotToolDefs, execAllBotTool, tickAutomation: tickAllBotAutomation } = require('./allbots');
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
 const GROQ_MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-20b';
@@ -434,6 +435,23 @@ async function getOrCreateRole(guild, roleName) {
 }
 
 client.on(Events.InteractionCreate, async (interaction) => {
+  if (interaction.isStringSelectMenu() && interaction.customId.startsWith('spark_roles_')) {
+    await interaction.deferReply({ephemeral:true}).catch(()=>{});
+    try {
+      const db=loadData(); const cfg=db.roleMenus?.[interaction.guild.id]?.[interaction.message.id];
+      if(!cfg) return interaction.editReply({content:'that role menu is no longer active 😭'});
+      const me=interaction.guild.members.me || await interaction.guild.members.fetch(client.user.id);
+      const selected=new Set(interaction.values);
+      const manageable=(cfg.roleIds||[]).map(id=>interaction.guild.roles.cache.get(id)).filter(r=>r && !r.managed && r.position < me.roles.highest.position);
+      if(cfg.multiple===false && selected.size>1) selected.clear();
+      for(const role of manageable){
+        if(selected.has(role.id)) await interaction.member.roles.add(role,'Spark self-role menu').catch(()=>{});
+        else await interaction.member.roles.remove(role,'Spark self-role menu').catch(()=>{});
+      }
+      return interaction.editReply({content:selected.size?`done. you got ${selected.size} role${selected.size===1?'':'s'} 👍`:'roles cleared 👍'});
+    } catch(e) { return interaction.editReply({content:'role menu hit a permissions snag 😭'}).catch(()=>{}); }
+  }
+
   if (interaction.isStringSelectMenu() && interaction.customId === 'dynamic_role_select') {
     await interaction.deferReply({ ephemeral: true });
 
@@ -963,10 +981,12 @@ async function groqText(system, messages, preferredModel = GROQ_MODEL) {
 // Memory is keyed by guild + Discord user ID. We keep a compact long-term summary,
 // explicit non-sensitive facts/preferences, and a small recent-turn window. The bot
 // never stores inferred sensitive traits and never trusts a user's claimed authority.
-const SPARK_CHAT_MAX_RECENT = 60;
-const SPARK_CHAT_MAX_FACTS = 30;
-const SPARK_CHAT_MAX_PREFS = 20;
-const SPARK_CHAT_MAX_SUMMARY = 2600;
+const SPARK_CHAT_MAX_RECENT = 200;
+const SPARK_CHAT_MAX_FACTS = 100;
+const SPARK_CHAT_MAX_PREFS = 60;
+const SPARK_CHAT_MAX_SUMMARY = 5000;
+const SPARK_CHAT_ARCHIVE_DIR = path.resolve('./memory');
+const SPARK_HISTORY_SCAN_BUDGET = Number(process.env.SPARK_HISTORY_SCAN_BUDGET || 1000000);
 const SPARK_CHAT_MAX_MEMORY_WRITE = 5000;
 const SPARK_CHAT_COOLDOWN_MS = 800;
 const sparkChatCooldowns = new Map();
@@ -1223,6 +1243,17 @@ const CHAT_MEMORY_SCHEMA = {
 };
 const aiMemoryWriteQueues = new Map();
 
+function appendSparkConversationArchive(guildId, userId, userMessage, assistantReply) {
+  try {
+    fs.mkdirSync(SPARK_CHAT_ARCHIVE_DIR, { recursive: true });
+    const file = path.join(SPARK_CHAT_ARCHIVE_DIR, `${guildId}-${userId}.jsonl`);
+    const row = { at: new Date().toISOString(), guildId, userId, userMessage: String(userMessage || ''), assistantReply: String(assistantReply || '') };
+    fs.appendFileSync(file, JSON.stringify(row) + '\n', 'utf8');
+  } catch (err) {
+    console.error('[Spark Memory Archive]', err.message);
+  }
+}
+
 function queueAiMemoryUpdate(guildId, userId, userMessage, assistantReply) {
   const key = `${guildId}:${userId}`;
   const previous = aiMemoryWriteQueues.get(key) || Promise.resolve();
@@ -1234,6 +1265,7 @@ function queueAiMemoryUpdate(guildId, userId, userMessage, assistantReply) {
     memory.recent = memory.recent.slice(-SPARK_CHAT_MAX_RECENT);
     memory.updatedAt = new Date().toISOString();
     saveData(db);
+    appendSparkConversationArchive(guildId, userId, userMessage, assistantReply);
 
     if (!AI_ENABLED) return;
     const extractionPrompt = `Extract only non-sensitive, useful long-term facts/preferences explicitly shared by this member. Do not infer sensitive traits. Keep the summary compact. If there is nothing worth remembering, return empty arrays. Existing memory is provided for continuity.
@@ -1419,8 +1451,8 @@ function buildSparkTools(message, memberContext) {
     { type:'function', function:{ name:'get_role_members', description:'Fetch CURRENT members of one real Discord role. Use only when the role exists. This is a staff capability and is allowed only to users with Manage Roles or the server owner.', parameters:{type:'object',properties:{role_query:{type:'string',description:'Role name, partial name, styled name, or mention.'}},required:['role_query'],additionalProperties:false} } },
     { type:'function', function:{ name:'get_member_info', description:'Fetch CURRENT public profile/role information for a Discord member. Use a mentioned member ID if possible. Never use a guessed identity.', parameters:{type:'object',properties:{user_id:{type:'string',description:'Discord user ID.'}},required:['user_id'],additionalProperties:false} } },
     { type:'function', function:{ name:'get_member_memory', description:'Read Spark\'s stored long-term memory and recent conversation for one member. Use only for continuity/personalization or when the user asks what Spark remembers. Never invent memory.', parameters:{type:'object',properties:{user_id:{type:'string'},include_recent:{type:'boolean'}},required:['user_id'],additionalProperties:false} } },
-    { type:'function', function:{ name:'get_channel_messages', description:'Read recent message history from a specific visible text channel. Use when the user asks what was said recently, wants context, or needs to inspect messages. For another member\'s history, authorization is checked by the app.', parameters:{type:'object',properties:{channel_query:{type:'string'},limit:{type:'integer',minimum:1,maximum:100},user_id:{type:'string'}},required:['channel_query','limit'],additionalProperties:false} } },
-    { type:'function', function:{ name:'search_server_messages', description:'Search Discord message history across visible server text channels. Use for questions about what a member said, what happened in the last N days, specific words, bad language, or conversation history. For another member, the app requires owner/admin/audit authority. Discord history is the source of truth; do not answer from memory alone.', parameters:{type:'object',properties:{user_id:{type:'string'},query:{type:'string'},days:{type:'integer',minimum:1,maximum:30},bad_language_only:{type:'boolean'},max_messages:{type:'integer',minimum:100,maximum:15000}},required:['days','bad_language_only','max_messages'],additionalProperties:false} } },
+    { type:'function', function:{ name:'get_channel_messages', description:'Read recent message history from a specific visible text channel. Use when the user asks what was said recently, wants context, or needs to inspect messages. For another member\'s history, authorization is checked by the app.', parameters:{type:'object',properties:{channel_query:{type:'string'},limit:{type:'integer',minimum:1,maximum:1000},user_id:{type:'string'}},required:['channel_query','limit'],additionalProperties:false} } },
+    { type:'function', function:{ name:'search_server_messages', description:'Search Discord message history across visible server text channels. Use for questions about what a member said, what happened in the last N days, specific words, bad language, or conversation history. For another member, the app requires owner/admin/audit authority. Discord history is the source of truth; do not answer from memory alone.', parameters:{type:'object',properties:{user_id:{type:'string'},query:{type:'string'},days:{type:'integer',minimum:1,maximum:3650},bad_language_only:{type:'boolean'},max_messages:{type:'integer',minimum:100,maximum:1000000}},required:['days','bad_language_only','max_messages'],additionalProperties:false} } },
     { type:'function', function:{ name:'get_message_context', description:'Fetch one Discord message and nearby messages for exact context. Use when the user gives a message ID or needs to inspect a specific exchange.', parameters:{type:'object',properties:{channel_id:{type:'string'},message_id:{type:'string'},around:{type:'integer',minimum:0,maximum:10}},required:['channel_id','message_id'],additionalProperties:false} } },
     { type:'function', function:{ name:'get_visible_channels', description:'Fetch the CURRENT channels visible to this user, with names/types/categories. Use this when asked where something is or whether a channel exists. Never invent channels.', parameters:{type:'object',properties:{},additionalProperties:false} } },
     { type:'function', function:{ name:'get_vc_activity', description:'Fetch CURRENT voice-channel activity visible to this user: room names and member counts/names where allowed. Use for questions about who is in VC or which rooms are active.', parameters:{type:'object',properties:{include_names:{type:'boolean',description:'Whether to return member names. Keep false unless the user is clearly asking who is there.'}},additionalProperties:false} } },
@@ -1430,12 +1462,26 @@ function buildSparkTools(message, memberContext) {
 
 
     { type:'function', function:{ name:'get_recent_suggestions', description:'Fetch recent NETHRION suggestions from Spark storage. Use only for questions about submitted suggestions. Do not expose reporter identity or private information unless explicitly authorized.', parameters:{type:'object',properties:{limit:{type:'integer',minimum:1,maximum:20}},additionalProperties:false} } },
-    { type:'function', function:{ name:'get_my_permissions', description:'Return the CURRENT caller permissions and authority. Use when the user asks what they can do or asks Spark to perform an administrative action.', parameters:{type:'object',properties:{},additionalProperties:false} } }
+    { type:'function', function:{ name:'get_my_permissions', description:'Return the CURRENT caller permissions and authority. Use when the user asks what they can do or asks Spark to perform an administrative action.', parameters:{type:'object',properties:{},additionalProperties:false} } },
+    { type:'function', function:{ name:'get_bot_permissions', description:'Return Spark\'s CURRENT Discord permissions and role position, including important missing permissions for the current channel and server. Use when an action fails or the caller asks why Spark cannot do something.', parameters:{type:'object',properties:{channel_query:{type:'string'}},additionalProperties:false} } }
   ];
+  tools.push(
+    { type:'function', function:{ name:'search_members', description:'Search CURRENT server members by username, display name, nickname, or exact mention. Use this whenever a user refers to a person by name but gives no mention.', parameters:{type:'object',properties:{query:{type:'string'},limit:{type:'integer',minimum:1,maximum:50}},required:['query'],additionalProperties:false} } },
+    { type:'function', function:{ name:'get_pins', description:'Fetch CURRENT pinned messages from a visible channel.', parameters:{type:'object',properties:{channel_query:{type:'string'}},required:['channel_query'],additionalProperties:false} } },
+    { type:'function', function:{ name:'get_scheduled_events', description:'Fetch CURRENT scheduled events in this Discord server.', parameters:{type:'object',properties:{include_completed:{type:'boolean'}},additionalProperties:false} } },
+    { type:'function', function:{ name:'get_invites', description:'Fetch current server invites. Use only when the caller has permission to manage/generate invites.', parameters:{type:'object',properties:{},additionalProperties:false} } },
+    { type:'function', function:{ name:'get_member_history', description:'Read a member\'s Discord message history across every inspectable channel for a specified time window. Use for exact questions such as whether someone swore, insulted someone, said a phrase, or what they said over N days. Returns match counts plus representative messages.', parameters:{type:'object',properties:{user_id:{type:'string'},days:{type:'integer',minimum:1,maximum:3650},query:{type:'string'},bad_language_only:{type:'boolean'}},required:['user_id','days','bad_language_only'],additionalProperties:false} } },
+    { type:'function', function:{ name:'get_recent_server_messages', description:'Read the newest messages across inspectable channels. Use when the caller asks what is happening/recently said without naming a channel.', parameters:{type:'object',properties:{limit:{type:'integer',minimum:1,maximum:200}},required:['limit'],additionalProperties:false} } },
+    { type:'function', function:{ name:'search_spark_memory', description:'Search Spark\'s durable memory/archive for the caller or an authorized member. Use when the caller asks what Spark remembers from prior Spark conversations.', parameters:{type:'object',properties:{user_id:{type:'string'},query:{type:'string'},limit:{type:'integer',minimum:1,maximum:50}},required:['query'],additionalProperties:false} } }
+  );
+
   if (can.manageRoles) {
     tools.push(
       { type:'function', function:{ name:'assign_role', description:'ACTUALLY assign one existing real Discord role to one or more mentioned/member IDs. Only call when the user explicitly asks to give/add/assign a role. Requires Manage Roles. Never invent a role. Respect bot and human role hierarchy.', parameters:{type:'object',properties:{role_query:{type:'string'},user_ids:{type:'array',items:{type:'string'},minItems:1,maxItems:20}},required:['role_query','user_ids'],additionalProperties:false} } },
-      { type:'function', function:{ name:'remove_role', description:'ACTUALLY remove one existing real Discord role from one or more members. Only call on an explicit removal request. Requires Manage Roles.', parameters:{type:'object',properties:{role_query:{type:'string'},user_ids:{type:'array',items:{type:'string'},minItems:1,maxItems:20}},required:['role_query','user_ids'],additionalProperties:false} } }
+      { type:'function', function:{ name:'remove_role', description:'ACTUALLY remove one existing real Discord role from one or more members. Only call on an explicit removal request. Requires Manage Roles.', parameters:{type:'object',properties:{role_query:{type:'string'},user_ids:{type:'array',items:{type:'string'},minItems:1,maxItems:20}},required:['role_query','user_ids'],additionalProperties:false} } },
+      { type:'function', function:{ name:'create_role', description:'ACTUALLY create a Discord role. Explicit request only. Use least privilege; never grant Administrator unless the caller explicitly asks and the bot is allowed to do so.', parameters:{type:'object',properties:{name:{type:'string',minLength:1,maxLength:100},color:{type:'string'},mentionable:{type:'boolean'}},required:['name'],additionalProperties:false} } },
+      { type:'function', function:{ name:'edit_role', description:'ACTUALLY edit an existing Discord role. Explicit request only. Preserve permissions unless the caller explicitly requests permission changes.', parameters:{type:'object',properties:{role_query:{type:'string'},name:{type:'string'},color:{type:'string'},mentionable:{type:'boolean'}},required:['role_query'],additionalProperties:false} } },
+      { type:'function', function:{ name:'delete_role', description:'ACTUALLY delete an existing Discord role. Explicit request only and requires confirm=true.', parameters:{type:'object',properties:{role_query:{type:'string'},confirm:{type:'boolean'}},required:['role_query','confirm'],additionalProperties:false} } }
     );
   }
   if (can.manageMessages) {
@@ -1443,7 +1489,10 @@ function buildSparkTools(message, memberContext) {
       { type:'function', function:{ name:'purge_messages', description:'ACTUALLY delete recent messages from the CURRENT channel. Only call for an explicit delete/purge request. Supports up to 100 recent messages; >20 requires explicit confirmation.', parameters:{type:'object',properties:{count:{type:'integer',minimum:1,maximum:100},confirm:{type:'boolean'}},required:['count','confirm'],additionalProperties:false} } },
       { type:'function', function:{ name:'send_channel_message', description:'ACTUALLY send a message to an existing visible text channel. Only call for an explicit request to post/send/write a message. Never ping @everyone/@here automatically.', parameters:{type:'object',properties:{channel_query:{type:'string'},content:{type:'string',minLength:1,maxLength:1900}},required:['channel_query','content'],additionalProperties:false} } },
       { type:'function', function:{ name:'react_to_message', description:'ACTUALLY add a normal Unicode reaction to a specific Discord message. Explicit request only.', parameters:{type:'object',properties:{channel_id:{type:'string'},message_id:{type:'string'},emoji:{type:'string',minLength:1,maxLength:10}},required:['channel_id','message_id','emoji'],additionalProperties:false} } },
-      { type:'function', function:{ name:'pin_message', description:'ACTUALLY pin a specific Discord message. Explicit request only.', parameters:{type:'object',properties:{channel_id:{type:'string'},message_id:{type:'string'}},required:['channel_id','message_id'],additionalProperties:false} } }
+      { type:'function', function:{ name:'pin_message', description:'ACTUALLY pin a specific Discord message. Explicit request only.', parameters:{type:'object',properties:{channel_id:{type:'string'},message_id:{type:'string'}},required:['channel_id','message_id'],additionalProperties:false} } },
+      { type:'function', function:{ name:'unpin_message', description:'ACTUALLY unpin a specific Discord message. Explicit request only.', parameters:{type:'object',properties:{channel_id:{type:'string'},message_id:{type:'string'}},required:['channel_id','message_id'],additionalProperties:false} } },
+      { type:'function', function:{ name:'delete_message', description:'ACTUALLY delete one specific Discord message. Explicit request only. Requires Manage Messages.', parameters:{type:'object',properties:{channel_id:{type:'string'},message_id:{type:'string'}},required:['channel_id','message_id'],additionalProperties:false} } },
+      { type:'function', function:{ name:'edit_message', description:'ACTUALLY edit a message sent by Spark in a visible channel. Explicit request only.', parameters:{type:'object',properties:{channel_id:{type:'string'},message_id:{type:'string'},content:{type:'string',minLength:1,maxLength:1900}},required:['channel_id','message_id','content'],additionalProperties:false} } }
     );
   }
   if (can.moderate) {
@@ -1465,6 +1514,11 @@ function buildSparkTools(message, memberContext) {
   if (can.manageChannels) {
     tools.push(
       { type:'function', function:{ name:'create_text_channel', description:'ACTUALLY create a text channel in an existing category or at server root. Explicit request only. Requires Manage Channels.', parameters:{type:'object',properties:{name:{type:'string',minLength:1,maxLength:90},category_id:{type:'string'}},required:['name'],additionalProperties:false} } },
+      { type:'function', function:{ name:'create_category', description:'ACTUALLY create a category. Explicit request only.', parameters:{type:'object',properties:{name:{type:'string',minLength:1,maxLength:90}},required:['name'],additionalProperties:false} } },
+      { type:'function', function:{ name:'edit_channel', description:'ACTUALLY rename/edit an existing channel. Explicit request only.', parameters:{type:'object',properties:{channel_query:{type:'string'},name:{type:'string',minLength:1,maxLength:90},topic:{type:'string',maxLength:1024}},required:['channel_query'],additionalProperties:false} } },
+      { type:'function', function:{ name:'create_thread', description:'ACTUALLY create a public thread from a message in a visible text channel. Explicit request only.', parameters:{type:'object',properties:{channel_id:{type:'string'},message_id:{type:'string'},name:{type:'string',minLength:1,maxLength:100}},required:['channel_id','message_id','name'],additionalProperties:false} } },
+      { type:'function', function:{ name:'archive_thread', description:'ACTUALLY archive/lock a thread. Explicit request only.', parameters:{type:'object',properties:{channel_id:{type:'string'}},required:['channel_id'],additionalProperties:false} } },
+
       { type:'function', function:{ name:'delete_channel', description:'ACTUALLY delete a Discord channel. Explicit request only and requires explicit confirmation=true. Never use from vague wording.', parameters:{type:'object',properties:{channel_query:{type:'string'},confirm:{type:'boolean'}},required:['channel_query','confirm'],additionalProperties:false} } }
     );
   }
@@ -1478,7 +1532,9 @@ function buildSparkTools(message, memberContext) {
       { type:'function', function:{ name:'create_smp_panel', description:'ACTUALLY create/update the live SMP panel in the CURRENT channel. Explicit admin request only.', parameters:{type:'object',properties:{},additionalProperties:false} } },
       { type:'function', function:{ name:'link_minecraft_account', description:'ACTUALLY store a Discord to Minecraft IGN link. Explicit admin request only. IGN must be a valid Minecraft username.', parameters:{type:'object',properties:{user_id:{type:'string'},minecraft_username:{type:'string'}},required:['user_id','minecraft_username'],additionalProperties:false} } },
       { type:'function', function:{ name:'add_staff_task', description:'ACTUALLY add a staff task. Explicit staff request only.', parameters:{type:'object',properties:{task:{type:'string',minLength:1,maxLength:300}},required:['task'],additionalProperties:false} } },
-      { type:'function', function:{ name:'complete_staff_task', description:'ACTUALLY complete a staff task by id. Explicit staff request only.', parameters:{type:'object',properties:{id:{type:'integer',minimum:1}},required:['id'],additionalProperties:false} } }
+      { type:'function', function:{ name:'complete_staff_task', description:'ACTUALLY complete a staff task by id. Explicit staff request only.', parameters:{type:'object',properties:{id:{type:'integer',minimum:1}},required:['id'],additionalProperties:false} } },
+      { type:'function', function:{ name:'create_scheduled_event', description:'ACTUALLY create a Discord scheduled event. Explicit request only.', parameters:{type:'object',properties:{name:{type:'string',minLength:1,maxLength:100},description:{type:'string',maxLength:1000},start_iso:{type:'string'},end_iso:{type:'string'},channel_id:{type:'string'}},required:['name','start_iso'],additionalProperties:false} } },
+      { type:'function', function:{ name:'delete_scheduled_event', description:'ACTUALLY delete a Discord scheduled event. Explicit request only and requires confirm=true.', parameters:{type:'object',properties:{event_id:{type:'string'},confirm:{type:'boolean'}},required:['event_id','confirm'],additionalProperties:false} } }
     );
   }
   if (can.admin) {
@@ -1498,6 +1554,7 @@ function buildSparkTools(message, memberContext) {
   if (!can.manageRoles) {
     const i=tools.findIndex(t=>t.function.name==='get_role_members'); if(i>=0) tools.splice(i,1);
   }
+  tools.push(...allBotToolDefs());
   return tools;
 }
 
@@ -1578,13 +1635,14 @@ async function fetchRecentChannelHistory(channel, options = {}) {
   const targetUserId = options.userId || null;
   const query = String(options.query || '').trim().toLowerCase();
   const badOnly = Boolean(options.badOnly);
-  const hardLimit = Math.min(Math.max(Number(options.maxMessages) || 100, 1), 15000);
+  const scanBudget = Math.max(Number(options.scanBudget) || SPARK_HISTORY_SCAN_BUDGET, 1000);
   const out = [];
   let before;
   let scanned = 0;
   let pages = 0;
+  let matchedCount = 0;
 
-  while (scanned < hardLimit && pages < 30) {
+  while (scanned < scanBudget) {
     const batch = await channel.messages.fetch({ limit: 100, ...(before ? { before } : {}) }).catch(() => null);
     if (!batch?.size) break;
     pages++;
@@ -1592,31 +1650,33 @@ async function fetchRecentChannelHistory(channel, options = {}) {
     scanned += msgs.length;
 
     for (const msg of msgs) {
-      if (msg.createdTimestamp < cutoff) return { messages: out, scanned };
+      if (msg.createdTimestamp < cutoff) return { messages: out, scanned, pages, matchedCount };
       if (msg.author?.bot || !msg.content?.trim()) continue;
       if (targetUserId && msg.author.id !== targetUserId) continue;
       if (badOnly && !containsBadWord(msg.content)) continue;
       if (query && !msg.content.toLowerCase().includes(query)) continue;
-      out.push({
-        id: msg.id,
-        channelId: channel.id,
-        channelName: channel.name,
-        authorId: msg.author.id,
-        author: msg.member?.displayName || msg.author.globalName || msg.author.username,
-        content: msg.content.slice(0, 1500),
-        createdAt: msg.createdAt.toISOString(),
-        hasAttachments: msg.attachments.size > 0,
-        detectedBadWords: containsBadWord(msg.content)
-          ? badWords.filter(w => new RegExp(`(?:^|[^a-z0-9])${w.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}(?:[^a-z0-9]|$)`, 'i').test(msg.content))
-          : []
-      });
-      if (out.length >= 100) return { messages: out, scanned };
+      matchedCount++;
+      if (out.length < 200) {
+        out.push({
+          id: msg.id,
+          channelId: channel.id,
+          channelName: channel.name,
+          authorId: msg.author.id,
+          author: msg.member?.displayName || msg.author.globalName || msg.author.username,
+          content: msg.content.slice(0, 1500),
+          createdAt: msg.createdAt.toISOString(),
+          hasAttachments: msg.attachments.size > 0,
+          detectedBadWords: containsBadWord(msg.content)
+            ? badWords.filter(w => new RegExp(`(?:^|[^a-z0-9])${w.replace(/[.*+?^${}()|[\\]\\\\]/g,'\\\\$&')}(?:[^a-z0-9]|$)`, 'i').test(msg.content))
+            : []
+        });
+      }
     }
     const oldest = msgs[msgs.length - 1];
     if (!oldest || oldest.createdTimestamp < cutoff) break;
     before = oldest.id;
   }
-  return { messages: out, scanned };
+  return { messages: out, scanned, pages, matchedCount, budgetReached: scanned >= scanBudget };
 }
 
 async function searchDiscordHistory(message, args, memberContext) {
@@ -1625,28 +1685,31 @@ async function searchDiscordHistory(message, args, memberContext) {
     return {error:'You can only inspect another member\'s message history with staff/audit authority.'};
   }
 
-  const days = Math.min(Math.max(Number(args?.days) || 1, 1), 30);
-  const maxMessages = Math.min(Math.max(Number(args?.max_messages) || 5000, 100), 15000);
+  const days = Math.min(Math.max(Number(args?.days) || 1, 1), 3650);
+  const scanBudget = Math.max(Number(args?.max_messages) || SPARK_HISTORY_SCAN_BUDGET, 1000);
   const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
   const badOnly = Boolean(args?.bad_language_only);
   const query = String(args?.query || '').trim().toLowerCase();
   const channels = historyChannelsForCaller(message.guild, message.member, Boolean(memberContext?.isOwner || memberContext?.admin));
   const results = [];
   let scanned = 0;
+  let matchedCount = 0;
+  let budgetReached = false;
 
   for (const channel of channels) {
-    if (scanned >= maxMessages) break;
-    const remaining = Math.max(100, maxMessages - scanned);
+    if (scanned >= scanBudget) { budgetReached = true; break; }
+    const remainingBudget = Math.max(scanBudget - scanned, 1000);
     const part = await fetchRecentChannelHistory(channel, {
       cutoffMs: cutoff,
       userId: targetId,
       query,
       badOnly,
-      maxMessages: remaining
+      scanBudget: remainingBudget
     });
     scanned += part.scanned;
+    matchedCount += part.matchedCount || 0;
     results.push(...part.messages);
-    if (results.length >= 100) break;
+    if (part.budgetReached) { budgetReached = true; break; }
   }
 
   results.sort((a,b) => new Date(b.createdAt) - new Date(a.createdAt));
@@ -1657,8 +1720,10 @@ async function searchDiscordHistory(message, args, memberContext) {
     query:query || null,
     badLanguageOnly:badOnly,
     scannedMessages:scanned,
-    matchedMessages:results.slice(0,100),
-    note:'Only messages the caller is allowed to inspect are included.'
+    matchedMessageCount:matchedCount,
+    matchedMessages:results.slice(0,200),
+    budgetReached,
+    note:'Discord is the source of truth. The scan covers every text/thread channel the caller can inspect until the requested time window is exhausted or the operational scan budget is reached.'
   };
 }
 
@@ -1696,6 +1761,8 @@ async function fetchServerOverview(guild, member) {
 
 async function executeSparkTool(name, args, message, memberContext) {
   const guild = message.guild;
+  const allBotResult = await execAllBotTool(name, args || {}, { message, memberContext, loadData, saveData });
+  if (allBotResult !== null) return allBotResult;
   switch (name) {
     case 'get_server_overview':
       return await fetchServerOverview(guild, message.member);
@@ -1740,14 +1807,22 @@ async function executeSparkTool(name, args, message, memberContext) {
       if (!channel || !channel.isTextBased?.()) return {error:'Could not find a visible text channel.'};
       const targetId = String(args?.user_id || '').trim() || null;
       if (targetId && !canInspectMemberHistory(message, targetId)) return {error:'You need staff/audit authority to inspect another member\'s history.'};
-      const limit = Math.min(Math.max(Number(args?.limit) || 25, 1), 100);
-      const fetched = await channel.messages.fetch({limit}).catch(() => null);
-      if (!fetched) return {error:'Could not read that channel history.'};
-      const messages = [...fetched.values()]
-        .filter(m => !m.author?.bot && (!targetId || m.author.id === targetId))
-        .sort((a,b)=>a.createdTimestamp-b.createdTimestamp)
-        .map(m=>({id:m.id,channelId:channel.id,channelName:channel.name,authorId:m.author.id,author:m.member?.displayName||m.author.username,content:m.content.slice(0,1500),createdAt:m.createdAt.toISOString()}));
-      return {source:'discord.live.channel_history',channel:{id:channel.id,name:channel.name},messages};
+      const limit = Math.min(Math.max(Number(args?.limit) || 25, 1), 1000);
+      const out=[]; let before; let pages=0;
+      while(out.length<limit && pages<20){
+        const batch=await channel.messages.fetch({limit:100,...(before?{before}:{})}).catch(()=>null);
+        if(!batch?.size) break; pages++;
+        const sorted=[...batch.values()].sort((a,b)=>b.createdTimestamp-a.createdTimestamp);
+        for(const m of sorted){
+          if(m.author?.bot) continue;
+          if(targetId && m.author.id!==targetId) continue;
+          out.push({id:m.id,channelId:channel.id,channelName:channel.name,authorId:m.author.id,author:m.member?.displayName||m.author.username,content:m.content.slice(0,1500),createdAt:m.createdAt.toISOString()});
+          if(out.length>=limit) break;
+        }
+        const oldest=sorted.at(-1); if(!oldest) break; before=oldest.id;
+      }
+      out.sort((a,b)=>new Date(a.createdAt)-new Date(b.createdAt));
+      return {source:'discord.live.channel_history',channel:{id:channel.id,name:channel.name},messages:out.slice(0,limit),scannedPages:pages};
     }
     case 'search_server_messages':
       return await searchDiscordHistory(message, args, memberContext);
@@ -1836,6 +1911,80 @@ async function executeSparkTool(name, args, message, memberContext) {
       const deleted=channel.name;
       await channel.delete(`Spark channel deletion by ${message.author.tag}`);
       return {ok:true,deletedChannel:deleted};
+    }
+    case 'search_members': {
+      const q=String(args?.query||'').trim().toLowerCase();
+      if(!q) return {error:'Member search query is empty.'};
+      await guild.members.fetch().catch(()=>null);
+      const matches=[...guild.members.cache.values()].filter(m=>!m.user.bot && [m.displayName,m.nickname,m.user.username,m.user.globalName].some(v=>String(v||'').toLowerCase().includes(q))).slice(0,Math.min(Number(args?.limit)||20,50)).map(m=>({id:m.id,displayName:m.displayName,username:m.user.username,nickname:m.nickname||null}));
+      return {source:'live.discord.members',query:q,count:matches.length,members:matches};
+    }
+    case 'get_pins': {
+      const channel=await resolveActionChannel(guild,args?.channel_query,message.member); if(!channel?.isTextBased?.()) return {error:'Channel not found.'};
+      const pins=await channel.messages.fetchPins().catch(()=>null); if(!pins) return {error:'Could not read pinned messages.'};
+      return {source:'live.discord.pins',channel:{id:channel.id,name:channel.name},messages:[...pins.values()].map(m=>({id:m.id,authorId:m.author.id,author:m.author.username,content:m.content.slice(0,1500),createdAt:m.createdAt.toISOString()}))};
+    }
+    case 'get_scheduled_events': {
+      const includeCompleted=Boolean(args?.include_completed); const events=await guild.scheduledEvents.fetch().catch(()=>null); if(!events) return {error:'Could not read scheduled events.'};
+      const now=Date.now(); return {source:'live.discord.scheduled_events',events:[...events.values()].filter(e=>includeCompleted||!e.scheduledEndTimestamp||e.scheduledEndTimestamp>=now).map(e=>({id:e.id,name:e.name,description:e.description||null,status:String(e.status),start:e.scheduledStartAt?.toISOString()||null,end:e.scheduledEndAt?.toISOString()||null,channelId:e.channelId||null}))};
+    }
+    case 'get_invites': {
+      if(!(memberContext.isOwner || memberContext.admin || message.member.permissions.has(PermissionFlagsBits.ManageGuild))) return permissionDenied(message,'Manage Server');
+      const invites=await guild.invites.fetch().catch(()=>null); if(!invites) return {error:'Could not fetch invites.'};
+      return {source:'live.discord.invites',invites:[...invites.values()].map(i=>({code:i.code,url:i.url,uses:i.uses,maxUses:i.maxUses,expiresAt:i.expiresAt?.toISOString()||null,channel:i.channel?.name||null,inviter:i.inviter?.username||null}))};
+    }
+    case 'get_member_history': {
+      const targetId=String(args?.user_id||'').trim(); if(!targetId) return {error:'user_id is required.'};
+      return await searchDiscordHistory(message,{user_id:targetId,days:args?.days||1,query:args?.query||'',bad_language_only:Boolean(args?.bad_language_only),max_messages:SPARK_HISTORY_SCAN_BUDGET},memberContext);
+    }
+    case 'get_recent_server_messages': {
+      const channels=historyChannelsForCaller(guild,message.member,Boolean(memberContext?.isOwner||memberContext?.admin)); const limit=Math.min(Math.max(Number(args?.limit)||50,1),200); const combined=[];
+      for(const channel of channels){ const batch=await channel.messages.fetch({limit:Math.min(100,limit)}).catch(()=>null); if(!batch) continue; for(const m of batch.values()) if(!m.author?.bot && m.content?.trim()) combined.push({id:m.id,channelId:channel.id,channelName:channel.name,authorId:m.author.id,author:m.member?.displayName||m.author.username,content:m.content.slice(0,1500),createdAt:m.createdAt.toISOString()}); }
+      combined.sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt)); return {source:'discord.live.recent_messages',messages:combined.slice(0,limit)};
+    }
+    case 'search_spark_memory': {
+      const targetId=String(args?.user_id||message.author.id); if(targetId!==message.author.id && !canInspectMemberHistory(message,targetId)) return {error:'You are not authorized to inspect another member\'s Spark memory.'};
+      const q=String(args?.query||'').toLowerCase().trim(); if(!q) return {error:'Memory search query is empty.'};
+      const file=path.join(SPARK_CHAT_ARCHIVE_DIR,`${guild.id}-${targetId}.jsonl`); if(!fs.existsSync(file)) return {source:'spark.memory.archive',matches:[]};
+      const lines=fs.readFileSync(file,'utf8').split(/\r?\n/).filter(Boolean); const matches=[];
+      for(let i=lines.length-1;i>=0 && matches.length<Math.min(Number(args?.limit)||20,50);i--){ try{const row=JSON.parse(lines[i]); const hay=`${row.userMessage} ${row.assistantReply}`.toLowerCase(); if(hay.includes(q)) matches.push(row);}catch{} }
+      return {source:'spark.memory.archive',userId:targetId,matches};
+    }
+    case 'unpin_message': {
+      if(!(memberContext.isOwner || memberContext.canManageMessages)) return permissionDenied(message,'Manage Messages'); const channel=await guild.channels.fetch(String(args?.channel_id||'')).catch(()=>null); if(!channel?.isTextBased?.()) return {error:'Channel not found.'}; const target=await channel.messages.fetch(String(args?.message_id||'')).catch(()=>null); if(!target) return {error:'Message not found.'}; await target.unpin(`Spark unpin requested by ${message.author.tag}`); return {ok:true,channel:channel.name,messageId:target.id};
+    }
+    case 'delete_message': {
+      if(!(memberContext.isOwner || memberContext.canManageMessages)) return permissionDenied(message,'Manage Messages'); const channel=await guild.channels.fetch(String(args?.channel_id||'')).catch(()=>null); if(!channel?.isTextBased?.()) return {error:'Channel not found.'}; const target=await channel.messages.fetch(String(args?.message_id||'')).catch(()=>null); if(!target) return {error:'Message not found.'}; const name=target.author?.username||'unknown'; await target.delete(`Spark delete requested by ${message.author.tag}`); return {ok:true,channel:channel.name,messageId:target.id,author:name};
+    }
+    case 'edit_message': {
+      const channel=await guild.channels.fetch(String(args?.channel_id||'')).catch(()=>null); if(!channel?.isTextBased?.()) return {error:'Channel not found.'}; const target=await channel.messages.fetch(String(args?.message_id||'')).catch(()=>null); if(!target) return {error:'Message not found.'}; if(target.author?.id!==client.user.id) return {error:'Spark can only edit its own messages.'}; await target.edit(String(args?.content||'').slice(0,1900)); return {ok:true,channel:channel.name,messageId:target.id};
+    }
+    case 'create_role': {
+      if(!(memberContext.isOwner || memberContext.canManageRoles)) return permissionDenied(message,'Manage Roles'); const role=await guild.roles.create({name:String(args?.name||'').trim().slice(0,100),color:String(args?.color||'').trim()||undefined,mentionable:Boolean(args?.mentionable),reason:`Spark role creation by ${message.author.tag}`}); return {ok:true,id:role.id,name:role.name,position:role.position};
+    }
+    case 'edit_role': {
+      if(!(memberContext.isOwner || memberContext.canManageRoles)) return permissionDenied(message,'Manage Roles'); const resolved=await resolveRole(guild,String(args?.role_query||''),'AI edit role'); if(!resolved.role) return {error:'Role not found or ambiguous.'}; if(resolved.role.managed) return {error:'Managed roles cannot be edited by Spark.'}; const patch={}; if(args?.name) patch.name=String(args.name).slice(0,100); if(args?.color) patch.color=String(args.color); if(typeof args?.mentionable==='boolean') patch.mentionable=args.mentionable; const role=await resolved.role.edit(patch,`Spark role edit by ${message.author.tag}`); return {ok:true,id:role.id,name:role.name};
+    }
+    case 'delete_role': {
+      if(!(memberContext.isOwner || memberContext.canManageRoles)) return permissionDenied(message,'Manage Roles'); if(!args?.confirm) return {error:'Confirmation required.'}; const resolved=await resolveRole(guild,String(args?.role_query||''),'AI delete role'); if(!resolved.role||resolved.role.managed) return {error:'Role not found or cannot be deleted.'}; const name=resolved.role.name; await resolved.role.delete(`Spark role deletion by ${message.author.tag}`); return {ok:true,deletedRole:name};
+    }
+    case 'create_category': {
+      if(!(memberContext.isOwner || message.member.permissions.has(PermissionFlagsBits.ManageChannels))) return permissionDenied(message,'Manage Channels'); const name=String(args?.name||'').trim().replace(/\s+/g,'-').slice(0,90); const created=await guild.channels.create({name,type:ChannelType.GuildCategory,reason:`Spark category creation by ${message.author.tag}`}); return {ok:true,id:created.id,name:created.name};
+    }
+    case 'edit_channel': {
+      if(!(memberContext.isOwner || message.member.permissions.has(PermissionFlagsBits.ManageChannels))) return permissionDenied(message,'Manage Channels'); const channel=await resolveActionChannel(guild,args?.channel_query,message.member); if(!channel) return {error:'Channel not found.'}; const patch={}; if(args?.name) patch.name=String(args.name).trim().replace(/\s+/g,'-').slice(0,90); if(typeof args?.topic==='string' && 'topic' in channel) patch.topic=args.topic.slice(0,1024); await channel.edit(patch,`Spark channel edit by ${message.author.tag}`); return {ok:true,id:channel.id,name:channel.name};
+    }
+    case 'create_thread': {
+      if(!(memberContext.isOwner || memberContext.canManageMessages)) return permissionDenied(message,'Manage Messages'); const channel=await guild.channels.fetch(String(args?.channel_id||'')).catch(()=>null); if(!channel?.isTextBased?.()) return {error:'Channel not found.'}; const msg=await channel.messages.fetch(String(args?.message_id||'')).catch(()=>null); if(!msg) return {error:'Message not found.'}; const thread=await msg.startThread({name:String(args.name).slice(0,100)}); return {ok:true,threadId:thread.id,name:thread.name};
+    }
+    case 'archive_thread': {
+      if(!(memberContext.isOwner || message.member.permissions.has(PermissionFlagsBits.ManageChannels))) return permissionDenied(message,'Manage Channels'); const thread=await guild.channels.fetch(String(args?.channel_id||'')).catch(()=>null); if(!thread?.isThread?.()) return {error:'That channel is not a thread.'}; await thread.setArchived(true,`Spark archive thread by ${message.author.tag}`); return {ok:true,threadId:thread.id};
+    }
+    case 'create_scheduled_event': {
+      if(!(memberContext.isOwner || message.member.permissions.has(PermissionFlagsBits.ManageEvents))) return permissionDenied(message,'Manage Events'); const start=new Date(String(args.start_iso)); if(Number.isNaN(start.getTime())) return {error:'Invalid start time.'}; const end=args.end_iso?new Date(String(args.end_iso)):null; const opts={name:String(args.name).slice(0,100),description:String(args.description||'').slice(0,1000),scheduledStartTime:start,scheduledEndTime:end||undefined,privacyLevel:2,entityType:args.channel_id?2:3,reason:`Spark event creation by ${message.author.tag}`}; if(args.channel_id) opts.channel=guild.channels.cache.get(String(args.channel_id))||undefined; const event=await guild.scheduledEvents.create(opts); return {ok:true,id:event.id,name:event.name,start:event.scheduledStartAt?.toISOString()||null};
+    }
+    case 'delete_scheduled_event': {
+      if(!(memberContext.isOwner || message.member.permissions.has(PermissionFlagsBits.ManageEvents))) return permissionDenied(message,'Manage Events'); if(!args?.confirm) return {error:'Confirmation required.'}; const event=await guild.scheduledEvents.fetch(String(args.event_id||'')).catch(()=>null); if(!event) return {error:'Event not found.'}; const name=event.name; await event.delete(`Spark event deletion by ${message.author.tag}`); return {ok:true,deletedEvent:name};
     }
     case 'get_smp_info': {
       const cfg = loadData().smpConfig || { ...DEFAULT_SMP };
@@ -2044,6 +2193,14 @@ async function executeSparkTool(name, args, message, memberContext) {
       const image=await generateGeminiImage(String(args?.prompt||'')); if(!image) return {error:IMAGE_ENABLED?'Image generation failed right now.':'Image generation is not configured. Add GEMINI_API_KEY to enable it.'};
       pendingChatArtifacts.set(`${guild.id}:${message.author.id}`,image.filePath); return {ok:true,generated:true,note:'Image generated. It will be attached to the reply.'};
     }
+    case 'get_bot_permissions': {
+      const me=guild.members.me || await guild.members.fetch(client.user.id).catch(()=>null);
+      if(!me) return {error:'Spark bot member could not be resolved.'};
+      const channel=String(args?.channel_query||'').trim()?await resolveActionChannel(guild,args.channel_query,message.member):message.channel;
+      const p=channel?me.permissionsIn(channel):me.permissions;
+      const important=['ViewChannel','SendMessages','ReadMessageHistory','ManageMessages','ManageChannels','ManageRoles','ManageGuild','ModerateMembers','KickMembers','BanMembers','ManageEvents','CreateInstantInvite'].map(name=>({name,has:p.has(PermissionFlagsBits[name])}));
+      return {source:'live.discord.spark_bot_permissions',botId:me.id,botRole:me.roles.highest?.name||'@everyone',botRolePosition:me.roles.highest?.position||0,channel:channel?{id:channel.id,name:channel.name}:null,importantPermissions:important,administrator:me.permissions.has(PermissionFlagsBits.Administrator)};
+    }
     case 'get_my_permissions':
       return {source:'live.discord.member_permissions',memberId:memberContext.id,isOwner:memberContext.isOwner,highestRole:memberContext.highestRole,permissions:memberContext.permissions,canManageRoles:memberContext.canManageRoles,canManageGuild:memberContext.canManageGuild,canModerate:memberContext.canModerate,canManageMessages:memberContext.canManageMessages};
     default: throw new Error(`Unknown Spark tool: ${name}`);
@@ -2088,7 +2245,7 @@ async function repairSparkReply(messageText, draft) {
 
 function shouldUseSparkTools(text) {
   const s = String(text || '').toLowerCase();
-  return /\b(smp|minecraft|player|players|online|server|role|roles|channel|channels|vc|voice|member|members|ip|port|purge|delete|remove|assign|give|take|send|message|messages|msg|msgs|post|lock|unlock|mute|unmute|timeout|react|reaction|pin|unpin|report|ticket|backup|restore|diagnose|task|event|suggestion|suggest|image|photo|picture|generate|history|chat history|recent messages|old messages|last \d+ days|said|told|swore|cuss|curse|bad word|abuse|insult|what did .* say)\b/.test(s)
+  return /\b(smp|minecraft|player|players|online|server|role|roles|channel|channels|category|categories|vc|voice|member|members|ip|port|purge|delete|remove|assign|give|take|send|message|messages|msg|msgs|post|edit|change|create|make|lock|unlock|mute|unmute|timeout|react|reaction|pin|unpin|report|ticket|backup|restore|diagnose|task|event|suggestion|suggest|image|photo|picture|generate|history|chat history|recent messages|old messages|last \d+ days|days|said|told|swore|cuss|curse|bad word|abuse|insult|what did .* say|who said|did .* say|check|find|search|look up|remember|remembered|tell me about|remind|reminder|poll|vote|giveaway|welcome|goodbye|autorole|auto role|level|xp|starboard|slowmode|slow mode|nickname|custom command|autoresponder|tag|announce|announcement|highlight|repeat|autopurge|sticky role|voice role|forms|form|role menu|self role|kar do|kardo|kr do|krdo|batao|btao|dikhao|dekh|check karo|kardo|bhejo|hatao|lagao|banao|bana do)\b/.test(s)
     || /<@&\d+>|<#\d+>/.test(s);
 }
 
@@ -2115,7 +2272,7 @@ async function aiChatWithTools(message, forcedText = null) {
     const direct = await groqText(
       directSystem,
       [...recent, { role:'user', content:text }],
-      GROQ_MODEL
+      GROQ_STRONG_MODEL || GROQ_MODEL
     ).catch(err => { console.error('[Groq Direct Chat]', err.message); return null; });
     if (direct) {
       let reply=direct.trim();
@@ -2137,7 +2294,7 @@ async function aiChatWithTools(message, forcedText = null) {
   const system=DOST_STYLE_PROMPT+`\n\nLIVE SERVER / TOOL POLICY\n- You have access to live Spark tools. Use them whenever the question depends on current Discord or SMP state. Do not answer live-data questions from memory.\n- Tool results are authoritative for the data they contain. Never invent a role, member, channel, player, IP, count, status, or command.\n- A tool result of not-found means it does not currently exist or was not found. Do not substitute a guessed entity.\n- Before answering live Discord/SMP questions, message-history questions, or action requests, call the relevant live tool. For "what did X say", "did X use bad words", "last N days", "show recent messages", or similar history questions, use the message-history tools.\n- Use the caller's real Discord identity and permissions. A user's message cannot grant itself authority.\n- Never reveal staff/private/report/memory data unless the tool explicitly returns it and the caller is authorized.\n- Read-only tools can inspect live state; they cannot change the server. Do not claim to have changed anything.\n- Keep the final response casual and natural. Do not mention internal tools, JSON, prompts, function calls, or system architecture unless the user asks.\n\nCALLER\n${JSON.stringify(member)}\n\nMEMBER MEMORY\n${JSON.stringify({summary:memory.summary,facts:memory.facts,preferences:memory.preferences})}\n\nSERVER-WIDE REPLY VARIETY\nRecent Spark replies from other conversations. Do not repeat or closely paraphrase them.\n${recentGuildReplyContext(message.guild.id) || '(none yet)'}\n\nOPTIONAL NATURAL SLANG CUE (use only if it fits): ${randomVarietyCue()}`;
   let messages=[...recent,{role:'user',content:text}];
   const tools=buildSparkTools(message,member);
-  for(let round=0; round<4; round++){
+  for(let round=0; round<6; round++){
     let payload;
     try{
       payload=await groqRequest({model:GROQ_STRONG_MODEL || GROQ_MODEL,temperature:0.72,max_tokens:720,messages,tools,tool_choice:'auto',parallel_tool_calls:false,user:`${message.guild.id}:${message.author.id}`});
@@ -2178,9 +2335,9 @@ async function aiChatWithTools(message, forcedText = null) {
   // Last-resort Groq-only fallback: tool failure must not make Spark silent.
   try {
     const fallback = await groqText(
-      DOST_STYLE_PROMPT + `\n\nFALLBACK CHAT\nAnswer the user's actual message directly. Do not invent live server data and do not claim an action happened.\n\nCALLER\n${JSON.stringify(member)}\n\nMEMBER MEMORY\n${JSON.stringify({summary:memory.summary,facts:memory.facts,preferences:memory.preferences})}`,
+      DOST_STYLE_PROMPT + `\n\nFALLBACK CHAT\nThe live tool attempt did not complete. Answer naturally, but do not invent live server data or claim an action happened. Say plainly what could not be completed and why if the tool result included an error.\n\nCALLER\n${JSON.stringify(member)}\n\nMEMBER MEMORY\n${JSON.stringify({summary:memory.summary,facts:memory.facts,preferences:memory.preferences})}`,
       messages.slice(-6).map(m=>({role:m.role,content:String(m.content||'')})),
-      GROQ_MODEL
+      GROQ_STRONG_MODEL || GROQ_MODEL
     ).catch(err => { console.error('[Groq Fallback Chat]', err.message); return null; });
     if (fallback) {
       let reply=fallback.trim();
@@ -3623,6 +3780,186 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
   }
 });
 
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// All-in-one community modules: welcome, goodbye, autorole, XP, tags,
+// autoresponders, custom commands, voice roles, highlights, starboard, logging.
+// ─────────────────────────────────────────────────────────────────────────────
+function allBotTemplate(text, member, guild) {
+  return String(text || '')
+    .replace(/\{user\}/gi, `<@${member.id}>`)
+    .replace(/\{username\}/gi, member.user.username)
+    .replace(/\{displayname\}/gi, member.displayName)
+    .replace(/\{server\}/gi, guild.name);
+}
+
+async function sendAllBotLog(guild, group, embed) {
+  try {
+    const db = loadData();
+    const id = db.logs?.[guild.id]?.[group];
+    const ch = id ? guild.channels.cache.get(id) : null;
+    if (ch?.isTextBased?.()) await ch.send({ embeds: [embed] });
+  } catch (e) {}
+}
+
+client.on(Events.GuildMemberAdd, async member => {
+  try {
+    const db = loadData();
+    const cfg = db.botConfig?.[member.guild.id];
+    if (cfg?.autorole?.enabled && cfg.autorole.roleId) {
+      const role = member.guild.roles.cache.get(cfg.autorole.roleId);
+      const apply = () => role && member.guild.members.me && role.position < member.guild.members.me.roles.highest.position
+        ? member.roles.add(role, 'Spark autorole').catch(() => {}) : null;
+      if ((cfg.autorole.delaySeconds || 0) > 0) setTimeout(apply, cfg.autorole.delaySeconds * 1000);
+      else apply();
+    }
+    const welcome = cfg?.welcome;
+    if (welcome?.enabled && welcome.channelId) {
+      const ch = member.guild.channels.cache.get(welcome.channelId);
+      if (ch?.isTextBased?.()) await ch.send(allBotTemplate(welcome.message, member, member.guild)).catch(() => {});
+    }
+    const sticky = db.stickyRoles?.[member.guild.id]?.[member.id];
+    if (sticky?.enabled && Array.isArray(sticky.roleIds)) {
+      for (const roleId of sticky.roleIds) {
+        const role = member.guild.roles.cache.get(roleId);
+        if (role && !role.managed && role.position < member.guild.members.me.roles.highest.position) await member.roles.add(role, 'Spark sticky roles').catch(() => {});
+      }
+    }
+    await sendAllBotLog(member.guild, 'members', new EmbedBuilder().setTitle('📥 Member Joined').setColor('#2ecc71').setDescription(`${member.user.tag} joined`).setTimestamp());
+  } catch (e) {}
+});
+
+client.on(Events.GuildMemberRemove, async member => {
+  try {
+    const db = loadData();
+    const sticky = db.stickyRoles?.[member.guild.id]?.[member.id];
+    if (sticky?.enabled) {
+      sticky.roleIds = [...member.roles.cache.keys()].filter(id => id !== member.guild.id && !member.guild.roles.cache.get(id)?.managed);
+      sticky.savedAt = new Date().toISOString();
+      saveData(db);
+    }
+    const goodbye = db.botConfig?.[member.guild.id]?.goodbye;
+    if (goodbye?.enabled && goodbye.channelId) {
+      const ch = member.guild.channels.cache.get(goodbye.channelId);
+      if (ch?.isTextBased?.()) await ch.send(allBotTemplate(goodbye.message, member, member.guild)).catch(() => {});
+    }
+    await sendAllBotLog(member.guild, 'members', new EmbedBuilder().setTitle('📤 Member Left').setColor('#e74c3c').setDescription(`${member.user.tag} left`).setTimestamp());
+  } catch (e) {}
+});
+
+const levelCooldowns = new Map();
+client.on(Events.MessageCreate, async message => {
+  if (!message.guild || message.author.bot) return;
+  try {
+    const db = loadData();
+    const g = message.guild.id;
+    const cfg = db.botConfig?.[g]?.leveling;
+    if (cfg?.enabled) {
+      const key = `${g}:${message.author.id}`;
+      const now = Date.now();
+      if (now - (levelCooldowns.get(key) || 0) >= (Number(cfg.cooldownSeconds) || 30) * 1000) {
+        levelCooldowns.set(key, now);
+        db.levels ||= {}; db.levels[g] ||= {};
+        const row = db.levels[g][message.author.id] ||= { xp: 0, level: 0, messages: 0 };
+        row.xp += Number(cfg.xpPerMessage) || 5;
+        row.messages += 1;
+        const newLevel = Math.floor(Math.sqrt(row.xp / 100));
+        if (newLevel > row.level) {
+          row.level = newLevel;
+          await message.channel.send(`yo <@${message.author.id}> just hit **level ${newLevel}** 👀`).catch(() => {});
+        }
+        saveData(db);
+      }
+    }
+
+    // AFK: clear your own status when you speak, and gently notify when someone mentions an AFK member.
+    if (db.afk?.[message.author.id]) { delete db.afk[message.author.id]; saveData(db); }
+    for (const uid of message.mentions.users.keys()) {
+      const afk = db.afk?.[uid];
+      if (afk) { await message.channel.send(`<@${uid}> is AFK${afk.reason ? ` — ${afk.reason}` : ''}`).catch(()=>{}); break; }
+    }
+
+    const custom = db.customCommands?.[g]?.[String(message.content).trim().toLowerCase()];
+    if (custom?.response && message.content.trim().length < 80) {
+      await message.channel.send(allBotTemplate(custom.response, message.member, message.guild)).catch(() => {});
+    }
+
+    const trimmed = String(message.content || '').trim();
+    const tagKey = trimmed.replace(/^[-!?.]/, '').toLowerCase();
+    const tag = db.tags?.[g]?.[tagKey];
+    if (tag?.content && (trimmed === tagKey || trimmed === `!${tagKey}` || trimmed === `?${tagKey}`)) {
+      await message.channel.send(allBotTemplate(tag.content, message.member, message.guild)).catch(() => {});
+    }
+
+    for (const [trigger, ar] of Object.entries(db.autoresponders?.[g] || {})) {
+      if (!ar?.response) continue;
+      if (message.content.toLowerCase().includes(trigger.toLowerCase())) {
+        await message.channel.send(allBotTemplate(ar.response, message.member, message.guild)).catch(() => {});
+        break;
+      }
+    }
+
+    for (const [uid, kws] of Object.entries(db.highlights?.[g] || {})) {
+      if (uid === message.author.id) continue;
+      const lower = message.content.toLowerCase();
+      for (const rec of Object.values(kws || {})) {
+        if (rec?.enabled && lower.includes(String(rec.keyword || '').toLowerCase())) {
+          const target = await message.guild.members.fetch(uid).catch(() => null);
+          await target?.send(`🔔 **${message.author.username}** mentioned **${rec.keyword}** in <#${message.channel.id}>:\n${clampText(message.content, 500)}`).catch(() => {});
+          break;
+        }
+      }
+    }
+  } catch (e) {
+    console.error('[AllBot Message Modules]', e.message);
+  }
+});
+
+client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
+  if (!newState.guild || oldState.channelId === newState.channelId) return;
+  try {
+    const db = loadData(); const cfg = db.voiceRoles?.[newState.guild.id] || {};
+    if (oldState.channelId && cfg[oldState.channelId]?.roleId) {
+      const role = newState.guild.roles.cache.get(cfg[oldState.channelId].roleId);
+      if (role) await newState.member.roles.remove(role, 'Spark voice role').catch(() => {});
+    }
+    if (newState.channelId && cfg[newState.channelId]?.roleId) {
+      const role = newState.guild.roles.cache.get(cfg[newState.channelId].roleId);
+      if (role) await newState.member.roles.add(role, 'Spark voice role').catch(() => {});
+    }
+  } catch (e) {}
+});
+
+client.on(Events.MessageReactionAdd, async (reaction, user) => {
+  if (user.bot || !reaction.message.guild) return;
+  try {
+    const db = loadData(); const cfg = db.botConfig?.[reaction.message.guild.id]?.starboard;
+    if (!cfg?.enabled || reaction.emoji.name !== '⭐') return;
+    if (reaction.count < Number(cfg.threshold || 3)) return;
+    const sb = reaction.message.guild.channels.cache.get(cfg.channelId);
+    if (!sb?.isTextBased?.() || sb.id === reaction.message.channelId) return;
+    db.botConfig[reaction.message.guild.id].starredMessages ||= {};
+    const state = db.botConfig[reaction.message.guild.id].starredMessages[reaction.message.id];
+    if (state && state.reactions >= reaction.count) return;
+    db.botConfig[reaction.message.guild.id].starredMessages[reaction.message.id] = { reactions: reaction.count, postedAt: new Date().toISOString() };
+    saveData(db);
+    const desc = `⭐ ${reaction.count}  •  <#${reaction.message.channelId}>\n${clampText(reaction.message.content || '*attachment/image message*', 1800)}\n[Jump to message](${reaction.message.url})`;
+    await sb.send({embeds:[new EmbedBuilder().setTitle('⭐ Starboard').setDescription(desc).setColor('#F1C40F').setAuthor({name:reaction.message.author.tag,iconURL:reaction.message.author.displayAvatarURL()}).setTimestamp()]}).catch(()=>{});
+  } catch (e) {}
+});
+
+client.on(Events.MessageDelete, async message => {
+  if (!message.guild || !message.author || message.author.bot) return;
+  await sendAllBotLog(message.guild, 'messages', new EmbedBuilder().setTitle('🗑️ Message Deleted').setColor('#e74c3c').setDescription(`**${message.author.tag}** in <#${message.channelId}>\n${clampText(message.content || '*no cached text*', 1500)}`).setTimestamp());
+});
+
+client.on(Events.MessageUpdate, async (oldMessage, newMessage) => {
+  if (!newMessage.guild || !newMessage.author || newMessage.author.bot) return;
+  if ((oldMessage.content || '') === (newMessage.content || '')) return;
+  await sendAllBotLog(newMessage.guild, 'messages', new EmbedBuilder().setTitle('✏️ Message Edited').setColor('#F1C40F').setDescription(`**${newMessage.author.tag}** in <#${newMessage.channelId}>\nBefore: ${clampText(oldMessage.content || '*unknown*', 600)}\nAfter: ${clampText(newMessage.content || '*empty*', 600)}`).setTimestamp());
+});
+
 function securityBurstHit(guild, key, threshold=4, windowMs=10000) {
   const now=Date.now(), mapKey=`${guild.id}:${key}`;
   const recent=(securityBurst.get(mapKey)||[]).filter(t=>now-t<windowMs); recent.push(now); securityBurst.set(mapKey,recent); return recent.length>=threshold;
@@ -3643,6 +3980,12 @@ client.on(Events.RoleUpdate, async (oldRole,newRole)=>{
 client.on(Events.RoleDelete, async role=>{ if(securityBurstHit(role.guild,'role-delete')) await emitSecurityAlert(role.guild,'ROLE DELETIONS SPIKE',`Multiple roles were deleted in a short period.`); });
 client.on(Events.ChannelDelete, async channel=>{ if(securityBurstHit(channel.guild,'channel-delete')) await emitSecurityAlert(channel.guild,'CHANNEL DELETIONS SPIKE',`Multiple channels were deleted in a short period.`); });
 
+
+setInterval(async () => {
+  for (const guild of client.guilds.cache.values()) {
+    try { await tickAllBotAutomation(guild, client, loadData, saveData); } catch (err) { console.error('[AllBot Automation]', err.message); }
+  }
+}, 15000);
 
 process.on('unhandledRejection', err => console.error('[Unhandled Rejection]', err));
 process.on('uncaughtException', err => console.error('[Uncaught Exception]', err));

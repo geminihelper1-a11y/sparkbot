@@ -1,13 +1,12 @@
 {
   "name": "spark-bot",
-  "version": "2.5.0-natural-actions",
+  "version": "2.5.1-gemini-image",
   "description": "NETHRION all-in-one Discord community and Minecraft operations bot",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "@google/generative-ai": "^0.24.1",
     "discord.js": "^14.27.0",
     "dotenv": "^16.4.5"
   }

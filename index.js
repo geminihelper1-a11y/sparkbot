@@ -23,9 +23,9 @@ require('dotenv').config();
 const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
 const GROQ_MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-20b';
 const GROQ_STRONG_MODEL = process.env.GROQ_STRONG_MODEL || 'openai/gpt-oss-120b';
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
-const IMAGE_MODEL = process.env.IMAGE_MODEL || 'gpt-image-2';
-const IMAGE_ENABLED = Boolean(OPENAI_API_KEY);
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const IMAGE_MODEL = process.env.GEMINI_IMAGE_MODEL || 'gemini-3.1-flash-image';
+const IMAGE_ENABLED = Boolean(GEMINI_API_KEY);
 const AI_ENABLED = Boolean(GROQ_API_KEY);
 
 const client = new Client({
@@ -983,29 +983,50 @@ Never add logos, watermarks, captions, or text unless the user explicitly asks f
 Do not force a cinematic look when it hurts the subject. Match the requested content first, then improve lighting, composition, detail, and color.
 `;
 
-async function generateOpenAIImage(userPrompt) {
-  if (!IMAGE_ENABLED) return null;
+async function generateGeminiImage(userPrompt) {
+  if (!IMAGE_ENABLED) return { error: 'not_configured' };
   const prompt = `${NETHRION_IMAGE_STYLE_PROMPT}\n\nUSER REQUEST:\n${clampText(userPrompt, 3000)}`;
   try {
-    const response = await fetch('https://api.openai.com/v1/images/generations', {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 90000);
+    const response = await fetch('https://generativelanguage.googleapis.com/v1beta/interactions', {
       method: 'POST',
-      headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: IMAGE_MODEL, prompt, size: '1024x1024', n: 1 })
-    });
+      headers: {
+        'x-goog-api-key': GEMINI_API_KEY,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: IMAGE_MODEL,
+        input: [{ type: 'text', text: prompt }],
+        response_format: {
+          type: 'image',
+          mime_type: 'image/png',
+          image_size: '2K',
+          aspect_ratio: '16:9'
+        }
+      }),
+      signal: controller.signal
+    }).finally(() => clearTimeout(timeout));
+
     const raw = await response.text();
-    if (!response.ok) throw new Error(`Image API HTTP ${response.status}: ${raw.slice(0,500)}`);
+    if (!response.ok) throw new Error(`Gemini Image API HTTP ${response.status}: ${raw.slice(0, 700)}`);
     const payload = JSON.parse(raw);
-    const item = payload?.data?.[0];
-    if (!item?.b64_json) return null;
+
+    const b64 = payload?.output_image?.data
+      || payload?.output?.find?.(item => item?.type === 'image')?.data
+      || payload?.steps?.flatMap?.(step => Array.isArray(step?.output) ? step.output : [])?.find?.(item => item?.type === 'image')?.data;
+
+    if (!b64) throw new Error('Gemini image response contained no image data.');
+
     const outDir = path.resolve('./generated-images');
     fs.mkdirSync(outDir, { recursive: true });
-    const fileName = `spark-${Date.now()}-${Math.random().toString(36).slice(2,8)}.png`;
+    const fileName = `spark-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.png`;
     const filePath = path.join(outDir, fileName);
-    fs.writeFileSync(filePath, Buffer.from(item.b64_json, 'base64'));
+    fs.writeFileSync(filePath, Buffer.from(b64, 'base64'));
     return { filePath, promptUsed: prompt };
   } catch (err) {
-    console.error('[Image Generation]', err.message);
-    return null;
+    console.error('[Gemini Image Generation]', err?.name === 'AbortError' ? 'Request timed out' : err?.message || err);
+    return { error: 'generation_failed' };
   }
 }
 
@@ -1665,7 +1686,8 @@ async function executeSparkTool(name, args, message, memberContext) {
     }
     case 'generate_image': {
       if (!actionCooldownOk(message,'generate_image',5000)) return {error:'Image generation cooldown. Give it a few seconds.'};
-      const image=await generateOpenAIImage(String(args?.prompt||'')); if(!image) return {error:IMAGE_ENABLED?'Image generation failed right now.':'Image generation is not configured. Add OPENAI_API_KEY to enable it.'};
+      const image=await generateGeminiImage(String(args?.prompt||''));
+      if (!image?.filePath) return {error:image?.error==='not_configured'?'Image generation is not configured. Add GEMINI_API_KEY to enable it.':'Gemini image generation failed right now. Check the API key, model access, or Gemini API response.'};
       pendingChatArtifacts.set(`${guild.id}:${message.author.id}`,image.filePath); return {ok:true,generated:true,note:'Image generated. It will be attached to the reply.'};
     }
     case 'get_my_permissions':

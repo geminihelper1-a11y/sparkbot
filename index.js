@@ -956,8 +956,7 @@ async function groqJson(system, user, schema, model = GROQ_MODEL) {
 }
 
 async function groqText(system, messages, preferredModel = GROQ_MODEL) {
-  const models = [preferredModel];
-  if (GROQ_STRONG_MODEL && GROQ_STRONG_MODEL !== preferredModel) models.push(GROQ_STRONG_MODEL);
+  const models = [preferredModel, GROQ_STRONG_MODEL, GROQ_MODEL].filter((m, i, arr) => m && arr.indexOf(m) === i);
   let lastError = null;
   for (const model of models) {
     try {
@@ -2348,7 +2347,7 @@ async function aiChatWithTools(message, forcedText = null) {
   try {
     const fallback = await groqText(
       DOST_STYLE_PROMPT + `\n\nFALLBACK CHAT\nThe live tool attempt did not complete. Answer naturally, but do not invent live server data or claim an action happened. Say plainly what could not be completed and why if the tool result included an error.\n\nCALLER\n${JSON.stringify(member)}\n\nMEMBER MEMORY\n${JSON.stringify({summary:memory.summary,facts:memory.facts,preferences:memory.preferences})}`,
-      messages.slice(-6).map(m=>({role:m.role,content:String(m.content||'')})),
+      messages.filter(m => m.role === 'user' || (m.role === 'assistant' && m.content)).slice(-6).map(m=>({role:m.role,content:String(m.content||'')})),
       GROQ_STRONG_MODEL || GROQ_MODEL
     ).catch(err => { console.error('[Groq Fallback Chat]', err.message); return null; });
     if (fallback) {

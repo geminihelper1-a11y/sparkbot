@@ -1155,6 +1155,7 @@ HUMAN TYPING / GEN-Z TEXTURE
 - Do not use racial slurs or identity-based insults as a personality gimmick.
 - Keep emotional reactions believable: "bro 😭", "nahhh 💀", "lmao what", "ayo??", "that's foul 😭" can work when earned. Do not turn every reply into emoji soup.
 - For jokes, create a genuinely different premise/punchline when the same request appears again. Do not replay the same joke sequence for another member.
+- When someone asks for a joke, actually land a real joke with a clear premise and punchline (desi/relatable setup: school, ghar, biryani, cricket, WiFi, exams, rickshaw, chai, etc). Do not default to a fake-out where the setup goes nowhere ("wait nvm idk") — that reads as confusing, not funny. A genuine anti-climax bit is fine occasionally, not as the default move.
 - Treat recent server-wide Spark replies as already heard by everyone.
 
 RAW DESI DISCORD EXAMPLES
@@ -1163,11 +1164,9 @@ Spark: "kuch nhi yaar 😭"
 User: "ye kya bakwas he"
 Spark: "haan bhai ye thori bakwas thi 💀"
 User: "tell me a joke"
-Spark: "acha sun... why did the chicken cross the road?
-
-wait nvm bro mujhe bhi nahi pata 😭"
+Spark: "teacher ne poocha 'tum late kyun ho' bacha bola 'ma'am raste mein signal tota tha' teacher: 'to?' bacha: 'to mujhe bhi lagi tut jaye 💀'"
 User: "nah boring"
-Spark: "fair 💀 ek aur try karta hun"
+Spark: "theek hai ek serious wala: bhai ne diet start ki thi, 2 din mein hi biryani ne usko wapis apna bana liya 💀"
 User: "i am tired"
 Spark: "same yaar. dimagh ne aaj strike maar di"
 User: "bro"
@@ -1451,6 +1450,7 @@ function buildSparkTools(message, memberContext) {
     { type:'function', function:{ name:'get_role_members', description:'Fetch CURRENT members of one real Discord role. Use only when the role exists. This is a staff capability and is allowed only to users with Manage Roles or the server owner.', parameters:{type:'object',properties:{role_query:{type:'string',description:'Role name, partial name, styled name, or mention.'}},required:['role_query'],additionalProperties:false} } },
     { type:'function', function:{ name:'get_member_info', description:'Fetch CURRENT public profile/role information for a Discord member. Use a mentioned member ID if possible. Never use a guessed identity.', parameters:{type:'object',properties:{user_id:{type:'string',description:'Discord user ID.'}},required:['user_id'],additionalProperties:false} } },
     { type:'function', function:{ name:'get_member_memory', description:'Read Spark\'s stored long-term memory and recent conversation for one member. Use only for continuity/personalization or when the user asks what Spark remembers. Never invent memory.', parameters:{type:'object',properties:{user_id:{type:'string'},include_recent:{type:'boolean'}},required:['user_id'],additionalProperties:false} } },
+    { type:'function', function:{ name:'send_channel_message', description:'Post a new message as Spark into a specific text channel. Use this whenever the user asks Spark to say/send/post/announce something in a named channel, e.g. "say hi in #lobby" or "post this in general".', parameters:{type:'object',properties:{channel_query:{type:'string'},content:{type:'string'}},required:['channel_query','content'],additionalProperties:false} } },
     { type:'function', function:{ name:'get_channel_messages', description:'Read recent message history from a specific visible text channel. Use when the user asks what was said recently, wants context, or needs to inspect messages. For another member\'s history, authorization is checked by the app.', parameters:{type:'object',properties:{channel_query:{type:'string'},limit:{type:'integer',minimum:1,maximum:1000},user_id:{type:'string'}},required:['channel_query','limit'],additionalProperties:false} } },
     { type:'function', function:{ name:'search_server_messages', description:'Search Discord message history across visible server text channels. Use for questions about what a member said, what happened in the last N days, specific words, bad language, or conversation history. For another member, the app requires owner/admin/audit authority. Discord history is the source of truth; do not answer from memory alone.', parameters:{type:'object',properties:{user_id:{type:'string'},query:{type:'string'},days:{type:'integer',minimum:1,maximum:3650},bad_language_only:{type:'boolean'},max_messages:{type:'integer',minimum:100,maximum:1000000}},required:['days','bad_language_only','max_messages'],additionalProperties:false} } },
     { type:'function', function:{ name:'get_message_context', description:'Fetch one Discord message and nearby messages for exact context. Use when the user gives a message ID or needs to inspect a specific exchange.', parameters:{type:'object',properties:{channel_id:{type:'string'},message_id:{type:'string'},around:{type:'integer',minimum:0,maximum:10}},required:['channel_id','message_id'],additionalProperties:false} } },
@@ -1801,6 +1801,18 @@ async function executeSparkTool(name, args, message, memberContext) {
         preferences:mem.preferences,
         recent:args?.include_recent === false ? [] : mem.recent.slice(-60)
       };
+    }
+    case 'send_channel_message': {
+      const channel = await resolveActionChannel(guild, args?.channel_query, message.member);
+      if (!channel || !channel.isTextBased?.()) return {error:'Could not find that channel.'};
+      try {
+        if (!message.member.permissionsIn(channel).has(PermissionFlagsBits.ViewChannel) || !message.member.permissionsIn(channel).has(PermissionFlagsBits.SendMessages)) return {error:'You do not have access to send messages in that channel.'};
+      } catch { return {error:'Could not verify channel access.'}; }
+      const content = String(args?.content || '').trim().slice(0,1900);
+      if (!content) return {error:'No message content given.'};
+      const sent = await channel.send(content).catch(() => null);
+      if (!sent) return {error:'Could not send the message. Spark may be missing permission in that channel.'};
+      return {ok:true, channel:channel.name, channelId:channel.id, messageId:sent.id};
     }
     case 'get_channel_messages': {
       const channel = await resolveActionChannel(guild, args?.channel_query, message.member);
@@ -2245,7 +2257,7 @@ async function repairSparkReply(messageText, draft) {
 
 function shouldUseSparkTools(text) {
   const s = String(text || '').toLowerCase();
-  return /\b(smp|minecraft|player|players|online|server|role|roles|channel|channels|category|categories|vc|voice|member|members|ip|port|purge|delete|remove|assign|give|take|send|message|messages|msg|msgs|post|edit|change|create|make|lock|unlock|mute|unmute|timeout|react|reaction|pin|unpin|report|ticket|backup|restore|diagnose|task|event|suggestion|suggest|image|photo|picture|generate|history|chat history|recent messages|old messages|last \d+ days|days|said|told|swore|cuss|curse|bad word|abuse|insult|what did .* say|who said|did .* say|check|find|search|look up|remember|remembered|tell me about|remind|reminder|poll|vote|giveaway|welcome|goodbye|autorole|auto role|level|xp|starboard|slowmode|slow mode|nickname|custom command|autoresponder|tag|announce|announcement|highlight|repeat|autopurge|sticky role|voice role|forms|form|role menu|self role|kar do|kardo|kr do|krdo|batao|btao|dikhao|dekh|check karo|kardo|bhejo|hatao|lagao|banao|bana do)\b/.test(s)
+  return /\b(smp|minecraft|player|players|online|server|role|roles|channel|channels|category|categories|vc|voice|member|members|ip|port|purge|delete|remove|assign|give|take|send|message|messages|msg|msgs|post|edit|change|create|make|lock|unlock|mute|unmute|timeout|react|reaction|pin|unpin|report|ticket|backup|restore|diagnose|task|event|suggestion|suggest|image|photo|picture|generate|history|chat history|recent messages|old messages|last \d+ days|days|said|told|swore|cuss|curse|bad word|abuse|insult|what did .* say|who said|did .* say|check|find|search|look up|remember|remembered|tell me about|remind|reminder|poll|vote|giveaway|welcome|goodbye|autorole|auto role|level|xp|starboard|slowmode|slow mode|nickname|custom command|autoresponder|tag|announce|announcement|highlight|repeat|autopurge|sticky role|voice role|forms|form|role menu|self role|kar do|kardo|kr do|krdo|batao|btao|dikhao|dekh|check karo|kardo|bhejo|hatao|lagao|banao|bana do|say|gali|bura bola|bad bola|kaha tha|bola tha|jake|jaake|jao|kaho|kehna|likh do|post kardo|bhej do)\b/.test(s)
     || /<@&\d+>|<#\d+>/.test(s);
 }
 

@@ -16,6 +16,8 @@ const {
   Events 
 } = require('discord.js');
 const fs = require('fs');
+const path = require('path');
+const zlib = require('zlib');
 require('dotenv').config();
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
@@ -973,16 +975,362 @@ function buildDiagnostics(guild) {
   return issues.length?issues:['✅ No obvious high-level problem found by the quick scan.'];
 }
 
-async function createServerBackup(guild) {
-  const backup={
-    exportedAt:new Date().toISOString(), guild:{id:guild.id,name:guild.name},
-    roles:[...guild.roles.cache.values()].map(r=>({id:r.id,name:r.name,position:r.position,color:r.hexColor,managed:r.managed,permissions:r.permissions.bitfield.toString()})),
-    channels:[...guild.channels.cache.values()].map(c=>({id:c.id,name:c.name,type:c.type,position:c.position,parentId:c.parentId,topic:c.topic||null,permissionOverwrites:c.permissionOverwrites?.cache ? [...c.permissionOverwrites.cache.values()].map(o=>({id:o.id,type:o.type,allow:o.allow.bitfield.toString(),deny:o.deny.bitfield.toString()})) : []})),
-    source:'Spark NETHRION backup'
+function crc32(buffer) {
+  let crc = 0xFFFFFFFF;
+  for (let i = 0; i < buffer.length; i++) {
+    crc ^= buffer[i];
+    for (let j = 0; j < 8; j++) crc = (crc >>> 1) ^ (0xEDB88320 & -(crc & 1));
+  }
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+
+function dosDateTime(date = new Date()) {
+  const year = Math.max(1980, date.getFullYear());
+  const time = (date.getHours() << 11) | (date.getMinutes() << 5) | Math.floor(date.getSeconds() / 2);
+  const day = ((year - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate();
+  return { time, day };
+}
+
+function makeZipFromDirectory(directory, outputPath) {
+  const files = [];
+  const walk = current => {
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      const full = path.join(current, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else files.push({ full, name: path.relative(directory, full).replace(/\\/g, '/') });
+    }
   };
-  const file=`./backup-${guild.id}-${Date.now()}.json`;
-  fs.writeFileSync(file,JSON.stringify(backup,null,2));
-  return file;
+  walk(directory);
+
+  const chunks = [];
+  const central = [];
+  let offset = 0;
+  const { time, day } = dosDateTime(new Date());
+
+  for (const file of files) {
+    const raw = fs.readFileSync(file.full);
+    const compressed = zlib.deflateRawSync(raw, { level: 6 });
+    const useCompressed = compressed.length < raw.length;
+    const data = useCompressed ? compressed : raw;
+    const method = useCompressed ? 8 : 0;
+    const crc = crc32(raw);
+    const nameBuf = Buffer.from(file.name, 'utf8');
+
+    const local = Buffer.alloc(30 + nameBuf.length);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(0, 6);
+    local.writeUInt16LE(method, 8);
+    local.writeUInt16LE(time, 10);
+    local.writeUInt16LE(day, 12);
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(data.length, 18);
+    local.writeUInt32LE(raw.length, 22);
+    local.writeUInt16LE(nameBuf.length, 26);
+    local.writeUInt16LE(0, 28);
+    nameBuf.copy(local, 30);
+    chunks.push(local, data);
+
+    const c = Buffer.alloc(46 + nameBuf.length);
+    c.writeUInt32LE(0x02014b50, 0);
+    c.writeUInt16LE(20, 4);
+    c.writeUInt16LE(20, 6);
+    c.writeUInt16LE(0, 8);
+    c.writeUInt16LE(method, 10);
+    c.writeUInt16LE(time, 12);
+    c.writeUInt16LE(day, 14);
+    c.writeUInt32LE(crc, 16);
+    c.writeUInt32LE(data.length, 20);
+    c.writeUInt32LE(raw.length, 24);
+    c.writeUInt16LE(nameBuf.length, 28);
+    c.writeUInt16LE(0, 30);
+    c.writeUInt16LE(0, 32);
+    c.writeUInt16LE(0, 34);
+    c.writeUInt16LE(0, 36);
+    c.writeUInt32LE(0, 38);
+    c.writeUInt32LE(offset, 42);
+    nameBuf.copy(c, 46);
+    central.push(c);
+
+    offset += local.length + data.length;
+  }
+
+  const centralSize = central.reduce((n, b) => n + b.length, 0);
+  const centralOffset = offset;
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(0, 4);
+  end.writeUInt16LE(0, 6);
+  end.writeUInt16LE(files.length, 8);
+  end.writeUInt16LE(files.length, 10);
+  end.writeUInt32LE(centralSize, 12);
+  end.writeUInt32LE(centralOffset, 16);
+  end.writeUInt16LE(0, 20);
+
+  fs.writeFileSync(outputPath, Buffer.concat([...chunks, ...central, end]));
+  return { files: files.length, bytes: fs.statSync(outputPath).size };
+}
+
+async function fetchAllMessages(channel) {
+  const results = [];
+  if (!channel?.messages?.fetch) return results;
+  let before;
+  while (true) {
+    const options = { limit: 100 };
+    if (before) options.before = before;
+    const batch = await channel.messages.fetch(options).catch(() => null);
+    if (!batch || batch.size === 0) break;
+    const sorted = [...batch.values()].sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+    for (const m of sorted) {
+      results.push({
+        id: m.id,
+        channelId: m.channelId,
+        authorId: m.author?.id || null,
+        author: m.author?.tag || m.author?.username || null,
+        createdAt: m.createdAt?.toISOString?.() || null,
+        editedAt: m.editedAt?.toISOString?.() || null,
+        content: m.content || '',
+        type: m.type ?? null,
+        pinned: Boolean(m.pinned),
+        tts: Boolean(m.tts),
+        mentions: {
+          users: [...m.mentions?.users?.keys?.() || []],
+          roles: [...m.mentions?.roles?.keys?.() || []],
+          everyone: Boolean(m.mentions?.everyone)
+        },
+        attachments: [...(m.attachments?.values?.() || [])].map(a => ({
+          id: a.id, name: a.name || null, size: a.size || null, url: a.url || null,
+          contentType: a.contentType || null
+        })),
+        embeds: (m.embeds || []).map(e => e.toJSON ? e.toJSON() : e),
+        stickers: [...(m.stickers?.values?.() || [])].map(s => ({
+          id: s.id, name: s.name || null, format: s.format || null
+        })),
+        reactions: [...(m.reactions?.cache?.values?.() || [])].map(r => ({
+          emoji: r.emoji?.identifier || r.emoji?.name || null,
+          count: r.count || 0
+        }))
+      });
+    }
+    const oldest = sorted[0];
+    if (!oldest || batch.size < 100) break;
+    before = oldest.id;
+  }
+  return results;
+}
+
+async function createServerBackup(guild) {
+  await guild.roles.fetch().catch(() => null);
+  await guild.channels.fetch().catch(() => null);
+  await guild.members.fetch().catch(() => null);
+
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const root = path.resolve('./backups', `${guild.id}-${stamp}`);
+  const messagesDir = path.join(root, 'messages');
+  const threadsDir = path.join(root, 'threads');
+  fs.mkdirSync(messagesDir, { recursive: true });
+  fs.mkdirSync(threadsDir, { recursive: true });
+
+  const channels = [...guild.channels.cache.values()].sort((a, b) => a.position - b.position);
+  const roles = [...guild.roles.cache.values()].sort((a, b) => b.position - a.position);
+
+  const server = {
+    id: guild.id,
+    name: guild.name,
+    iconURL: guild.iconURL({ extension: 'png', size: 1024 }) || null,
+    ownerId: guild.ownerId,
+    description: guild.description || null,
+    preferredLocale: guild.preferredLocale || null,
+    verificationLevel: guild.verificationLevel ?? null,
+    explicitContentFilter: guild.explicitContentFilter ?? null,
+    defaultMessageNotifications: guild.defaultMessageNotifications ?? null,
+    afkChannelId: guild.afkChannelId || null,
+    afkTimeout: guild.afkTimeout || null,
+    systemChannelId: guild.systemChannelId || null,
+    rulesChannelId: guild.rulesChannelId || null,
+    publicUpdatesChannelId: guild.publicUpdatesChannelId || null,
+    createdAt: guild.createdAt?.toISOString?.() || null
+  };
+
+  fs.writeFileSync(path.join(root, 'server.json'), JSON.stringify(server, null, 2));
+
+  fs.writeFileSync(path.join(root, 'roles.json'), JSON.stringify(roles.map(r => ({
+    id: r.id, name: r.name, position: r.position, color: r.hexColor || '#000000',
+    hoist: Boolean(r.hoist), mentionable: Boolean(r.mentionable),
+    managed: Boolean(r.managed), permissions: r.permissions.toArray()
+  })), null, 2));
+
+  fs.writeFileSync(path.join(root, 'members.json'), JSON.stringify(
+    [...guild.members.cache.values()].map(m => ({
+      id: m.id,
+      username: m.user.username,
+      displayName: m.displayName,
+      bot: Boolean(m.user.bot),
+      joinedAt: m.joinedAt?.toISOString?.() || null,
+      roles: [...m.roles.cache.keys()].filter(id => id !== guild.id)
+    })), null, 2
+  ));
+
+  const channelRecords = [];
+  let messageCount = 0;
+  let threadMessageCount = 0;
+
+  for (const c of channels) {
+    const overwrites = c.permissionOverwrites?.cache
+      ? [...c.permissionOverwrites.cache.values()].map(o => ({
+          id: o.id, type: o.type, allow: o.allow.toArray(), deny: o.deny.toArray()
+        }))
+      : [];
+
+    const record = {
+      id: c.id, name: c.name, type: c.type, position: c.rawPosition ?? c.position ?? 0,
+      parentId: c.parentId || null, topic: c.topic || null,
+      nsfw: Boolean(c.nsfw), rateLimitPerUser: c.rateLimitPerUser ?? 0,
+      bitrate: c.bitrate ?? null, userLimit: c.userLimit ?? null,
+      rtcRegion: c.rtcRegion ?? null, videoQualityMode: c.videoQualityMode ?? null,
+      defaultAutoArchiveDuration: c.defaultAutoArchiveDuration ?? null,
+      defaultThreadRateLimitPerUser: c.defaultThreadRateLimitPerUser ?? null,
+      permissionOverwrites: overwrites,
+      url: c.url || null
+    };
+    if (c.type === ChannelType.GuildForum && c.availableTags) {
+      record.availableTags = c.availableTags.map(t => ({ id: t.id, name: t.name, moderated: t.moderated, emojiId: t.emojiId || null, emojiName: t.emojiName || null }));
+      record.defaultReactionEmoji = c.defaultReactionEmoji ? {
+        emojiId: c.defaultReactionEmoji.emojiId || null,
+        emojiName: c.defaultReactionEmoji.emojiName || null
+      } : null;
+      record.defaultSortOrder = c.defaultSortOrder ?? null;
+      record.defaultForumLayout = c.defaultForumLayout ?? null;
+    }
+    channelRecords.push(record);
+
+    if (c.isTextBased?.() && c.type !== ChannelType.GuildCategory && c.messages?.fetch) {
+      const messages = await fetchAllMessages(c);
+      messageCount += messages.length;
+      if (messages.length) {
+        fs.writeFileSync(path.join(messagesDir, `${c.id}.jsonl`),
+          messages.map(m => JSON.stringify(m)).join('\n') + '\n');
+      }
+
+      if (c.threads?.fetchActive) {
+        const active = await c.threads.fetchActive().catch(() => null);
+        const threadList = active ? [...active.threads.values()] : [];
+        for (const thread of threadList) {
+          const threadMsgs = await fetchAllMessages(thread);
+          threadMessageCount += threadMsgs.length;
+          if (threadMsgs.length) {
+            fs.writeFileSync(path.join(threadsDir, `${thread.id}.jsonl`),
+              threadMsgs.map(m => JSON.stringify(m)).join('\n') + '\n');
+          }
+        }
+      }
+    }
+  }
+
+  let emojis = [];
+  await guild.emojis.fetch().then(col => { emojis = [...col.values()].map(e => ({ id:e.id, name:e.name, animated:e.animated, url:e.url })); }).catch(() => {});
+  fs.writeFileSync(path.join(root, 'emojis.json'), JSON.stringify(emojis, null, 2));
+
+  let stickers = [];
+  await guild.stickers.fetch().then(col => { stickers = [...col.values()].map(s => ({ id:s.id, name:s.name, description:s.description, tags:s.tags, format:s.format, available:s.available, url:s.url })); }).catch(() => {});
+  fs.writeFileSync(path.join(root, 'stickers.json'), JSON.stringify(stickers, null, 2));
+
+  fs.writeFileSync(path.join(root, 'channels.json'), JSON.stringify(channelRecords, null, 2));
+
+  let events = [];
+  await guild.scheduledEvents.fetch().then(col => { events = [...col.values()].map(e => ({
+    id:e.id, name:e.name, description:e.description, scheduledStartAt:e.scheduledStartAt?.toISOString?.() || null,
+    scheduledEndAt:e.scheduledEndAt?.toISOString?.() || null, status:e.status, entityType:e.entityType,
+    entityMetadata:e.entityMetadata || null
+  })); }).catch(() => {});
+  fs.writeFileSync(path.join(root, 'scheduled-events.json'), JSON.stringify(events, null, 2));
+
+  let bans = [];
+  if (guild.bans?.fetch) {
+    await guild.bans.fetch().then(col => { bans = [...col.values()].map(b => ({
+      userId:b.user.id, username:b.user.username, reason:b.reason || null
+    })); }).catch(() => {});
+  }
+  fs.writeFileSync(path.join(root, 'bans.json'), JSON.stringify(bans, null, 2));
+
+  let webhooks = [];
+  if (guild.fetchWebhooks) {
+    await guild.fetchWebhooks().then(col => { webhooks = [...col.values()].map(w => ({
+      id:w.id, name:w.name, type:w.type, channelId:w.channelId, applicationId:w.applicationId || null
+    })); }).catch(() => {});
+  }
+  fs.writeFileSync(path.join(root, 'webhooks.json'), JSON.stringify(webhooks, null, 2));
+
+  const manifest = {
+    format: 'spark-nethrion-backup',
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    guildId: guild.id,
+    guildName: guild.name,
+    counts: {
+      roles: roles.length,
+      members: guild.members.cache.size,
+      channels: channelRecords.length,
+      messages: messageCount,
+      threadMessages: threadMessageCount,
+      emojis: emojis.length,
+      stickers: stickers.length,
+      scheduledEvents: events.length,
+      bans: bans.length,
+      webhooks: webhooks.length
+    },
+    messageArchive: {
+      includes: 'message content, authors, timestamps, edits, mentions, attachments metadata/URLs, embeds, stickers and reaction counts',
+      excludes: 'DMs and binary attachment files themselves; Discord/API-restricted data that could not be fetched'
+    }
+  };
+  fs.writeFileSync(path.join(root, 'manifest.json'), JSON.stringify(manifest, null, 2));
+
+  fs.writeFileSync(path.join(root, 'README.md'), [
+    '# Spark NETHRION Backup',
+    '',
+    `Server: ${guild.name} (${guild.id})`,
+    `Created: ${manifest.exportedAt}`,
+    '',
+    'This backup contains the server structure and the accessible message history captured by Spark.',
+    'Attachment URLs and metadata are stored; attachment binaries are not downloaded.',
+    'Anything Discord did not expose to the bot is marked by the manifest rather than being guessed.',
+    '',
+    'This archive is intended for recovery/reference. Restoration requires a separate restore pass that recreates objects in dependency order.'
+  ].join('\n'));
+
+  const zipPath = `${root}.zip`;
+  const zipInfo = makeZipFromDirectory(root, zipPath);
+  return {
+    root,
+    zipPath,
+    zipBytes: zipInfo.bytes,
+    ...manifest.counts
+  };
+}
+
+async function sendBackupArtifact(message, backup) {
+  const MAX_ATTACHMENT = 24 * 1024 * 1024;
+  const sizeMB = backup.zipBytes / (1024 * 1024);
+  const counts = [
+    `Roles: **${backup.roles}**`,
+    `Members: **${backup.members}**`,
+    `Channels: **${backup.channels}**`,
+    `Messages: **${backup.messages.toLocaleString()}**`,
+    `Thread messages: **${backup.threadMessages.toLocaleString()}**`
+  ].join(' · ');
+
+  if (backup.zipBytes <= MAX_ATTACHMENT) {
+    const sent = await message.channel.send({
+      content: `╭─ ✦ 💾 **NETHRION BACKUP COMPLETE** ✦ ─╮\n${counts}\n📦 Archive: **${sizeMB.toFixed(1)} MB**`,
+      files: [{ attachment: backup.zipPath, name: `NETHRION-Backup-${new Date().toISOString().slice(0,10)}.zip` }]
+    });
+    return sent;
+  }
+
+  return message.channel.send({
+    content: `╭─ ✦ 💾 **NETHRION BACKUP READY** ✦ ─╮\n${counts}\n📦 Archive: **${sizeMB.toFixed(1)} MB**\n⚠️ The archive is larger than the current single-file Discord upload limit, so Spark kept the complete backup on disk instead of sending a partial archive.`
+  });
 }
 
 const liveChannelActivity = new Map();
@@ -1566,10 +1914,60 @@ client.on('messageCreate', async (message) => {
   }
 
   if (subCmd === 'backup') {
-    if(message.author.id!==message.guild.ownerId && !message.member.permissions.has(PermissionFlagsBits.ManageGuild)) return message.reply('❌ Manage Server permission required.');
-    const file=await createServerBackup(message.guild);
-    const sent=await message.channel.send({content:'💾 **NETHRION backup created.**',files:[file]});
-    setTimeout(()=>sent.delete().catch(()=>{}),15000); fs.unlink(file,()=>{}); return;
+    if (message.author.id !== message.guild.ownerId && !message.member.permissions.has(PermissionFlagsBits.Administrator)) {
+      return message.reply('❌ Only the server owner or an Administrator can create a full backup.');
+    }
+
+    const progress = await message.channel.send({
+      content: '╭─ ✦ 💾 **SPARK BACKUP** ✦ ─╮\nPreparing a full NETHRION snapshot…'
+    }).catch(() => null);
+
+    try {
+      const backup = await createServerBackup(message.guild);
+      if (progress) await progress.delete().catch(() => {});
+      const sent = await sendBackupArtifact(message, backup);
+      return sent;
+    } catch (err) {
+      console.error('[Backup Error]:', err);
+      if (progress) {
+        return progress.edit({
+          content: `╭─ ✦ 💾 **BACKUP FAILED** ✦ ─╮\n❌ ${String(err.message || err).slice(0, 1500)}`
+        }).catch(() => message.reply('❌ Backup failed.'));
+      }
+      return message.reply('❌ Backup failed.');
+    }
+  }
+
+  if (subCmd === 'backups') {
+    if (message.author.id !== message.guild.ownerId && !message.member.permissions.has(PermissionFlagsBits.Administrator)) {
+      return message.reply('❌ Owner/Admin only.');
+    }
+    const dir = path.resolve('./backups');
+    if (!fs.existsSync(dir)) return message.reply('💾 No Spark backups have been created on this instance yet.');
+
+    const entries = fs.readdirSync(dir, { withFileTypes: true })
+      .filter(e => e.isDirectory() && e.name.startsWith(`${message.guild.id}-`))
+      .sort((a, b) => b.name.localeCompare(a.name))
+      .slice(0, 10);
+
+    if (!entries.length) return message.reply('💾 No backups found for this server on this instance.');
+
+    const lines = [];
+    for (const [i, entry] of entries.entries()) {
+      const archive = path.join(dir, `${entry.name}.zip`);
+      const bytes = fs.existsSync(archive) ? fs.statSync(archive).size : 0;
+      lines.push(`**${i + 1}.** \`${entry.name.split(message.guild.id + '-')[1]}\` · ${bytes ? `${(bytes / 1024 / 1024).toFixed(1)} MB` : 'archive missing'}`);
+    }
+    return message.channel.send({
+      embeds: [
+        new EmbedBuilder()
+          .setTitle('💾 NETHRION BACKUPS')
+          .setColor('#5865F2')
+          .setDescription(lines.join('\n'))
+          .setFooter({ text: 'Backups are stored on the Spark host. Railway storage is ephemeral.' })
+          .setTimestamp()
+      ]
+    });
   }
 
   if (subCmd === 'ask') {
@@ -1619,7 +2017,8 @@ client.on('messageCreate', async (message) => {
             '`sp roles-panel` - Post the notification-role selector.',
             '`sp link @user MinecraftIGN` - Manually store a Minecraft link when DiscordSRV does not expose it.',
             '`sp diagnose` - Scan the server for obvious configuration risks.',
-            '`sp backup` - Export the server structure to JSON.',
+            '`sp backup` - Create a full server backup (structure + accessible history).',
+            '`sp backups` - List recent backups for this server.',
             '`sp summary` - AI-assisted community pulse.',
             '`sp cases` - AI-assisted report summary.'
           ].join('\n')

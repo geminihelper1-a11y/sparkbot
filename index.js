@@ -18,6 +18,7 @@ const {
 const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
+const net = require('net');
 require('dotenv').config();
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
@@ -45,6 +46,7 @@ const userSelectedChannels = new Map();
 const mcPanelFingerprint = new Map();
 const aiCooldowns = new Map();
 const securityBurst = new Map();
+const pendingDiscordSRVLookups = new Map();
 
 // NETHRION SMP defaults; `sp smp-set` overrides them per guild.
 const DEFAULT_SMP = {
@@ -307,6 +309,198 @@ client.once(Events.ClientReady, () => {
     } catch (err) { console.error('[Activity Save Error]:', err.message); }
   }, 60 * 1000);
 });
+
+
+function getDiscordSrvLookupChannelId() {
+  return String(process.env.DISCORDSRV_LINK_EVENT_CHANNEL_ID || '').trim();
+}
+
+function getDiscordSrvBotId() {
+  return String(process.env.DISCORDSRV_BOT_ID || '').trim();
+}
+
+function isValidDiscordId(value) {
+  return /^\d{17,20}$/.test(String(value || '').trim());
+}
+
+function buildRconPacket(requestId, packetType, body) {
+  const bodyBuffer = Buffer.from(`${body}\0`, 'utf8');
+  const packetLength = 4 + 4 + bodyBuffer.length + 1;
+  const packet = Buffer.alloc(4 + packetLength);
+  packet.writeInt32LE(packetLength, 0);
+  packet.writeInt32LE(requestId, 4);
+  packet.writeInt32LE(packetType, 8);
+  bodyBuffer.copy(packet, 12);
+  return packet;
+}
+
+function executeMinecraftRcon(command, timeoutMs = 2500) {
+  const host = String(process.env.DISCORDSRV_RCON_HOST || '').trim();
+  const port = Number(process.env.DISCORDSRV_RCON_PORT || 25575);
+  const password = String(process.env.DISCORDSRV_RCON_PASSWORD || '');
+
+  if (!host || !password || !Number.isInteger(port) || port < 1 || port > 65535) {
+    return Promise.resolve({ ok: false, reason: 'RCON not configured' });
+  }
+
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    let settled = false;
+    let authed = false;
+    let buffer = Buffer.alloc(0);
+    const authId = Math.floor(Math.random() * 0x3fffffff) + 1;
+    const execId = authId + 1;
+
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(result);
+    };
+
+    const timer = setTimeout(() => finish({ ok: authed, reason: authed ? 'timeout' : 'RCON connection timeout' }), timeoutMs);
+
+    const consumePackets = () => {
+      while (buffer.length >= 4) {
+        const length = buffer.readInt32LE(0);
+        if (length < 10 || length > 10 * 1024 * 1024) {
+          clearTimeout(timer);
+          return finish({ ok: false, reason: 'Invalid RCON packet' });
+        }
+        if (buffer.length < length + 4) return;
+        const packet = buffer.subarray(4, length + 4);
+        const requestId = packet.readInt32LE(0);
+        const packetType = packet.readInt32LE(4);
+        const nul = packet.indexOf(0, 8);
+        const body = nul >= 0 ? packet.subarray(8, nul).toString('utf8') : '';
+        buffer = buffer.subarray(length + 4);
+
+        if (!authed && (packetType === 2 || requestId === authId)) {
+          if (requestId === -1) return finish({ ok: false, reason: 'RCON authentication failed' });
+          authed = true;
+          socket.write(buildRconPacket(execId, 2, command));
+          // DiscordSRV's /discordsrv linked command performs its lookup asynchronously.
+          // We only need to know that the command was accepted; the machine-readable
+          // result arrives through the DiscordSRV alerts bridge.
+          setTimeout(() => finish({ ok: true, response: body }), 350);
+          return;
+        }
+      }
+    };
+
+    socket.on('data', (chunk) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      consumePackets();
+    });
+    socket.on('error', (err) => {
+      clearTimeout(timer);
+      finish({ ok: false, reason: err.message });
+    });
+    socket.on('close', () => {
+      clearTimeout(timer);
+      if (!settled) finish({ ok: authed, reason: authed ? 'RCON closed' : 'RCON closed before authentication' });
+    });
+
+    socket.setTimeout(timeoutMs, () => {
+      clearTimeout(timer);
+      finish({ ok: authed, reason: authed ? 'RCON socket timeout' : 'RCON socket timeout' });
+    });
+
+    socket.connect(port, host, () => {
+      socket.write(buildRconPacket(authId, 3, password));
+    });
+  });
+}
+
+function registerDiscordSrvLookup(discordId, timeoutMs = 6000) {
+  const key = String(discordId);
+  return new Promise((resolve) => {
+    const list = pendingDiscordSRVLookups.get(key) || [];
+    const entry = {
+      resolve: (value) => {
+        clearTimeout(entry.timer);
+        resolve(value);
+      },
+      timer: null
+    };
+
+    entry.timer = setTimeout(() => {
+      const current = pendingDiscordSRVLookups.get(key) || [];
+      const remaining = current.filter(item => item !== entry);
+      if (remaining.length) pendingDiscordSRVLookups.set(key, remaining);
+      else pendingDiscordSRVLookups.delete(key);
+      resolve(null);
+    }, timeoutMs);
+
+    list.push(entry);
+    pendingDiscordSRVLookups.set(key, list);
+  });
+}
+
+function parseMinecraftLinkLookup(message) {
+  const channelId = getDiscordSrvLookupChannelId();
+  if (channelId && message.channel.id !== channelId) return null;
+
+  const trustedBot = getDiscordSrvBotId();
+  if (trustedBot && message.author?.id !== trustedBot) return null;
+
+  const blobs = [];
+  if (message.content) blobs.push(String(message.content));
+  for (const e of message.embeds || []) {
+    if (e.title) blobs.push(String(e.title));
+    if (e.description) blobs.push(String(e.description));
+    if (e.author?.name) blobs.push(String(e.author.name));
+    for (const f of e.fields || []) blobs.push(`${f.name || ''} ${f.value || ''}`);
+  }
+  const text = blobs.join('\n');
+
+  const match = text.match(/SPARK_LOOKUP\|discord_id=(\d{17,20})\|minecraft_uuid=(null|[0-9a-f-]{32,36})\|minecraft_username=([A-Za-z0-9_]{3,16}|null)/i);
+  if (!match) return null;
+
+  return {
+    discordId: match[1],
+    minecraftUuid: match[2].toLowerCase() === 'null' ? null : match[2],
+    minecraftUsername: match[3].toLowerCase() === 'null' ? null : match[3],
+    createdAt: message.createdTimestamp || Date.now()
+  };
+}
+
+async function lookupDiscordSRVLink(discordId) {
+  if (!isValidDiscordId(discordId)) return { status: 'unavailable', reason: 'invalid Discord ID' };
+
+  const channelId = getDiscordSrvLookupChannelId();
+  const rconHost = String(process.env.DISCORDSRV_RCON_HOST || '').trim();
+  const rconPassword = String(process.env.DISCORDSRV_RCON_PASSWORD || '');
+
+  if (!channelId) return { status: 'unavailable', reason: 'DISCORDSRV_LINK_EVENT_CHANNEL_ID is not configured' };
+  if (!rconHost || !rconPassword) return { status: 'unavailable', reason: 'DiscordSRV RCON is not configured' };
+
+  const requestedAt = Date.now();
+  const resultPromise = registerDiscordSrvLookup(discordId, 6000);
+  const rcon = await executeMinecraftRcon(`discordsrv linked ${discordId}`);
+  if (!rcon.ok) {
+    // We still wait briefly in case the server accepted the command just before the socket closed.
+    const lateResult = await Promise.race([
+      resultPromise,
+      new Promise(resolve => setTimeout(() => resolve(null), 1200))
+    ]);
+    if (lateResult && lateResult.createdAt >= requestedAt) {
+      return lateResult.minecraftUsername
+        ? { status: 'linked', ...lateResult }
+        : { status: 'not_linked', ...lateResult };
+    }
+    return { status: 'unavailable', reason: rcon.reason || 'RCON command failed' };
+  }
+
+  const result = await resultPromise;
+  if (!result || result.createdAt < requestedAt) {
+    return { status: 'unavailable', reason: 'DiscordSRV lookup response timed out' };
+  }
+
+  return result.minecraftUsername
+    ? { status: 'linked', ...result }
+    : { status: 'not_linked', ...result };
+}
 
 function parseMinecraftLinkEvent(message) {
   // Authoritative DiscordSRV bridge. Spark runs remotely (e.g. Railway), so it cannot directly
@@ -2302,6 +2496,14 @@ client.on('messageCreate', async (message) => {
   try {
   if (!message.guild) return;
   if (message.author.bot || message.webhookId) {
+    const lookup = parseMinecraftLinkLookup(message);
+    if (lookup?.discordId) {
+      const waiters = pendingDiscordSRVLookups.get(lookup.discordId) || [];
+      pendingDiscordSRVLookups.delete(lookup.discordId);
+      for (const waiter of waiters) waiter.resolve(lookup);
+      if (message.author.bot) return;
+    }
+
     await handleMinecraftLinkEvent(message).catch(() => {});
     if (message.author.bot) return;
   }
@@ -2908,11 +3110,56 @@ client.on('messageCreate', async (message) => {
     const target=message.mentions.members.first()||message.member;
     const u=db.streaks?.[target.id]||{};
     const reportCount=(db.reports||[]).filter(r=>r.targetId===target.id).length;
-    const linkData=db.links?.[target.id]||null; const link=linkData?.minecraftUsername||'Not linked'; const linkSource=linkData?.source ? ` (${linkData.source})` : '';
     const roles=target.roles.cache.filter(r=>r.id!==message.guild.id).sort((a,b)=>b.position-a.position).first(8).map(r=>r.name).join(', ')||'None';
-    return message.channel.send({embeds:[new EmbedBuilder().setTitle(`👤 ${target.displayName}`).setColor('#5865F2').setThumbnail(target.user.displayAvatarURL()).addFields(
-      {name:'Roles',value:roles}, {name:'Minecraft',value:`\`${link}\`${linkSource}`,inline:true}, {name:'Reports',value:`\`${reportCount}\``,inline:true}, {name:'Streak',value:`\`${u.currentStreak||0} days\``,inline:true}
-    ).setTimestamp()]});
+
+    // DiscordSRV is the source of truth for Discord ↔ Minecraft linking.
+    // A live lookup is attempted on every profile request, so accounts linked before
+    // Spark existed are also detected. The local cache remains only as a fallback
+    // when the live bridge is unavailable.
+    const liveLink = await lookupDiscordSRVLink(target.id).catch(err => ({
+      status: 'unavailable',
+      reason: err?.message || 'lookup failed'
+    }));
+
+    let minecraftValue = '⚠️ Check unavailable';
+    let linkStatus = '⚠️ DiscordSRV check unavailable';
+
+    if (liveLink.status === 'linked') {
+      const mcName = liveLink.minecraftUsername || 'Unknown';
+      minecraftValue = `\`${mcName}\``;
+      linkStatus = `✅ Linked`;
+      db.links = db.links || {};
+      db.links[target.id] = {
+        minecraftUsername: mcName,
+        minecraftUuid: liveLink.minecraftUuid || null,
+        linkedAt: db.links[target.id]?.linkedAt || new Date().toISOString(),
+        source: 'DiscordSRV'
+      };
+      saveData(db);
+    } else if (liveLink.status === 'not_linked') {
+      minecraftValue = '`Not linked`';
+      linkStatus = '❌ Not linked';
+      if (db.links?.[target.id]?.source === 'DiscordSRV') {
+        delete db.links[target.id];
+        saveData(db);
+      }
+    } else if (db.links?.[target.id]?.minecraftUsername) {
+      minecraftValue = `\`${db.links[target.id].minecraftUsername}\``;
+      linkStatus = '⚠️ Live check unavailable · cached link';
+    }
+
+    return message.channel.send({embeds:[new EmbedBuilder()
+      .setTitle(`👤 ${target.displayName}`)
+      .setColor('#5865F2')
+      .setThumbnail(target.user.displayAvatarURL())
+      .addFields(
+        {name:'Roles',value:roles},
+        {name:'DiscordSRV',value:linkStatus,inline:true},
+        {name:'Minecraft',value:minecraftValue,inline:true},
+        {name:'Reports',value:`\`${reportCount}\``,inline:true},
+        {name:'Streak',value:`\`${u.currentStreak||0} days\``,inline:true}
+      )
+      .setTimestamp()]});
   }
 
   if (subCmd === 'diagnose') {

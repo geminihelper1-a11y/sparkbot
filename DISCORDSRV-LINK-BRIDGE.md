@@ -18,3 +18,6 @@ Set these Railway variables if you use a dedicated link-event channel:
 Both are optional, but using both is strongly recommended. They prevent unrelated messages from becoming link records.
 
 Once the event is received, Spark stores the real Discord ID -> Minecraft username/UUID mapping with `source: DiscordSRV`. `sp profile` will then show that linked account. Unlink events remove the mapping.
+
+
+For live `sp profile` lookups (including links created before Spark existed), see `DISCORDSRV-PROFILE-SETUP.md`. The live path uses the DiscordSRV `linked` command over Minecraft RCON plus a machine-readable `SPARK_LOOKUP` alerts response; the local event cache is only a fallback.

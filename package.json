@@ -1,26 +1,18 @@
 {
   "name": "nethrion-bot",
-  "version": "10.0.2",
-  "description": "NETHRION Discord + Minecraft operations bot rebuilt from SparkBot V9",
-  "main": "src/app/index.js",
-  "type": "commonjs",
+  "version": "2.0.0",
+  "description": "NETHRION BOT 2.0 - Operating system of the Discord community and Minecraft SMP",
+  "main": "index.js",
   "scripts": {
-    "start": "node src/app/index.js",
-    "dev": "node --watch src/app/index.js",
-    "test": "node --test tests/*.test.js",
-    "migrate": "node migration/migrate-legacy.js",
-    "doctor": "node scripts/doctor.js",
-    "register": "node src/discord/register-commands.js",
-    "check": "node scripts/static-check.js",
-    "quality": "npm run check && npm test"
-  },
-  "engines": {
-    "node": ">=22"
+    "start": "node index.js",
+    "test": "node tests/smokeTest.js"
   },
   "dependencies": {
-    "@google/genai": "2.23.0",
-    "better-sqlite3": "13.0.3",
-    "discord.js": "14.27.0",
-    "dotenv": "16.4.5"
+    "@google/genai": "^2.24.0",
+    "@google/generative-ai": "^0.24.0",
+    "archiver": "^7.0.1",
+    "discord.js": "^14.18.0",
+    "dotenv": "^16.4.5",
+    "groq-sdk": "^1.6.0"
   }
 }

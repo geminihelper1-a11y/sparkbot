@@ -1,3 +1,0 @@
-const fs=require('node:fs');const path=require('node:path');const {spawnSync}=require('node:child_process');
-const roots=['src','migration','scripts','tests'];let bad=0;for(const root of roots){for(const file of walk(root)){if(!file.endsWith('.js'))continue;const r=spawnSync(process.execPath,['--check',file],{encoding:'utf8'});if(r.status!==0){bad++;process.stderr.write(r.stderr||`Syntax error: ${file}\n`);}}}if(bad)process.exit(1);console.log('Static JavaScript syntax check passed.');
-function walk(dir){const out=[];for(const e of fs.readdirSync(dir,{withFileTypes:true})){const p=path.join(dir,e.name);if(e.isDirectory())out.push(...walk(p));else out.push(p);}return out;}

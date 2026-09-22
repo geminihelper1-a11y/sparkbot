@@ -1,0 +1,11 @@
+2026-09-22T09:43:04.720Z [INFO] [DATABASE] Migrating legacy data.json to Nethrion 2.0 format... {"path":"C:\\Users\\Logical\\Downloads\\sparkbot-main (1)\\sparkbot-main\\data.json"}
+2026-09-22T09:43:04.722Z [INFO] [DATABASE] Migration complete. Saved to C:\Users\Logical\Downloads\sparkbot-main (1)\sparkbot-main\data\nethrion_data.json
+2026-09-22T09:43:39.392Z [INFO] [DATABASE] Migrating legacy data.json to Nethrion 2.0 format... {"path":"C:\\Users\\Logical\\Downloads\\sparkbot-main (1)\\sparkbot-main\\data.json"}
+2026-09-22T09:43:39.393Z [INFO] [DATABASE] Migration complete. Saved to C:\Users\Logical\Downloads\sparkbot-main (1)\sparkbot-main\data\nethrion_data.json
+2026-09-22T09:43:39.396Z [AUDIT] [LINK_BRIDGE] Linked test_discord_user to Mindzard_Fan_1
+2026-09-22T09:45:01.468Z [INFO] [BOOT] ================================================
+2026-09-22T09:45:01.470Z [INFO] [BOOT] Starting NETHRION BOT 2.0...
+2026-09-22T09:45:01.471Z [INFO] [BOOT] ================================================
+2026-09-22T09:45:01.474Z [INFO] [DATABASE] Loaded Nethrion database. {"path":"C:\\Users\\Logical\\Downloads\\sparkbot-main (1)\\sparkbot-main\\data\\nethrion_data.json"}
+2026-09-22T09:45:02.700Z [INFO] [EVENT_ROUTER] Single-source Discord event listeners registered.
+2026-09-22T09:45:02.701Z [WARN] [AUTH] DISCORD_TOKEN is not set in environment or .env file. Bot is idle in offline test mode.

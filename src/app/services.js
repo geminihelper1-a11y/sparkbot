@@ -22,6 +22,7 @@ const {MemoryService}=require('../memory/service');
 const {OnboardingService}=require('../onboarding/service');
 const {DashboardServer}=require('../dashboard/server');
 const {RecapService}=require('../recap/service');
+const {PanelService}=require('../panels/service');
 
 function buildServices(config,logger){
   const db=new NethrionDB(config.databasePath);db.migrate();const repos=new Repositories(db);
@@ -44,7 +45,8 @@ function buildServices(config,logger){
   const agent=new Agent({router:ai,toolRegistry:[],repos,config,logger});
   const onboarding=new OnboardingService({repos,logger});
   const recap=new RecapService({db});
-  const services={db,repos,discord,permissions,actions:actionService,knowledge,memory,minecraft,analytics,scheduler,tickets,suggestions,moderation,backups,health,ai,agent,onboarding,recap};
+  const panels=new PanelService({repos,minecraft,logger,config});
+  const services={db,repos,discord,permissions,actions:actionService,knowledge,memory,minecraft,analytics,scheduler,tickets,suggestions,moderation,backups,health,ai,agent,onboarding,recap,panels};
   services.dashboard=new DashboardServer({config,services,logger});
   const tools=buildToolRegistry(services);agent.tools=tools;services.tools=tools;
   return services;

@@ -18,3 +18,6 @@ NETHRION public replies are intentionally compact. Live tool results are never s
 `get_smp_status` → `Java — Offline · 0/0 players` and `Bedrock — Offline · 0/0 players`
 
 `get_server_overview` must never become a raw JSON block in a public channel.
+
+## Panel behavior
+Panel commands are functional commands, not placeholders. `sp smp-panel` creates or refreshes a live SMP panel in the current channel. `sp ticket-panel`, `sp roles-panel`, and `sp anon-panel` create their respective interactive panels. Public panel messages never expose raw tool JSON, internal IDs, implementation notes, or setup-only text.

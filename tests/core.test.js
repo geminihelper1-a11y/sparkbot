@@ -41,3 +41,11 @@ test('action engine creates a confirmation plan before high-risk execution',asyn
  const confirmed=await engine.run({guild:g,member,args:{channel_id:'c1'},request:'confirm',actionId:preview.actionId,confirm:true},spec);
  assert.equal(confirmed.state,'SUCCESS');assert.equal(executed,true);
 });
+
+test('panel commands are real implementations, not setup placeholders',()=>{
+  const fs=require('node:fs');
+  const app=fs.readFileSync(require('node:path').join(__dirname,'../src/app/index.js'),'utf8');
+  assert.doesNotMatch(app,/Panel creation is intentionally centralized/);
+  assert.match(app,/services\.panels\.handleCommand\(message,sub\.replace\('-panel',''\)\)/);
+  assert.match(app,/services\.panels\.refreshAllSmpPanels/);
+});

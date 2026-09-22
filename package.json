@@ -1,6 +1,6 @@
 {
   "name": "nethrion-bot",
-  "version": "10.0.1",
+  "version": "10.0.2",
   "description": "NETHRION Discord + Minecraft operations bot rebuilt from SparkBot V9",
   "main": "src/app/index.js",
   "type": "commonjs",

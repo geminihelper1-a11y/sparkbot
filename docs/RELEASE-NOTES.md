@@ -37,3 +37,10 @@ The design favors a smaller reliable public surface over exposing every historic
 
 ## Public response layer hardening
 All user-facing Discord responses now pass through shared NETHRION formatters. Raw tool JSON, internal Discord IDs, provider metadata, evidence objects, and database-shaped responses are no longer used as normal public reply text. AI tool fallbacks are rendered as concise human-readable answers, and the control center/overview/SMP/health/analytics/recap surfaces use the same visual language.
+
+
+## 10.0.2 — Panel Command Restoration
+- `sp smp-panel` creates or refreshes a live SMP panel in the current channel.
+- `sp ticket-panel`, `sp roles-panel`, and `sp anon-panel` create functional panels instead of a setup placeholder.
+- Public panel copy is concise and avoids internal IDs or raw JSON.
+- SMP panels refresh automatically every 60 seconds and on configuration update.

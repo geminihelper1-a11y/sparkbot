@@ -28,3 +28,12 @@ Intentionally not promoted to public v2 core:
 - automatic creation of a large channel tree
 
 The design favors a smaller reliable public surface over exposing every historical feature immediately.
+
+## 10.0.1 command compatibility fix
+- Restored legacy `sp help` and `sp help admin` prefix help.
+- `sp help` shows public/member commands.
+- `sp help admin` shows member, staff, and admin/owner commands and requires Administrator or server-owner access.
+
+
+## Public response layer hardening
+All user-facing Discord responses now pass through shared NETHRION formatters. Raw tool JSON, internal Discord IDs, provider metadata, evidence objects, and database-shaped responses are no longer used as normal public reply text. AI tool fallbacks are rendered as concise human-readable answers, and the control center/overview/SMP/health/analytics/recap surfaces use the same visual language.

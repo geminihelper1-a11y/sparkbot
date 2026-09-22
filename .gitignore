@@ -1,0 +1,10 @@
+node_modules/
+.env
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+logs/*.log
+backups/*
+!backups/.gitkeep
+data/*
+!data/.gitkeep

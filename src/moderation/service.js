@@ -1,0 +1,8 @@
+class ModerationService{
+  constructor({db,logger}){this.db=db;this.logger=logger;this.windows=new Map();this.joinWindows=new Map();}
+  detect(message){const signals=[];const content=String(message.content||'');if(/https?:\/\//i.test(content))signals.push('link');if(message.mentions?.everyone||message.mentions?.users?.size>=5)signals.push('mass_mentions');if(/(?:free|nitro|claim|gift).{0,30}(?:now|here|click)/i.test(content))signals.push('possible_scam');return signals;}
+  incident(guildId,key,severity,evidence){const now=new Date().toISOString();const old=this.db.prepare(`SELECT * FROM security_incidents WHERE guild_id=? AND incident_key=?`).get(guildId,key);this.db.prepare(`INSERT INTO security_incidents(guild_id,incident_key,severity,status,evidence_json,first_seen_at,last_seen_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(guild_id,incident_key) DO UPDATE SET last_seen_at=excluded.last_seen_at,evidence_json=excluded.evidence_json,severity=excluded.severity`).run(guildId,key,severity,'OPEN',JSON.stringify(evidence),now,now);return {created:!old,incidentKey:key,severity};}
+  observeJoin(guildId,userId,windowMs=60000,threshold=8){const now=Date.now();const arr=(this.joinWindows.get(guildId)||[]).filter(t=>now-t<windowMs);arr.push(now);this.joinWindows.set(guildId,arr);if(arr.length>=threshold)return this.incident(guildId,'join-burst','HIGH',{count:arr.length,windowMs});return {created:false};}
+  observeMessage(message){const signals=this.detect(message);if(!signals.length)return {created:false,signals:[]};const key=signals.sort().join('|');const r=this.incident(message.guild.id,`signals:${key}`,'MEDIUM',[{messageId:message.id,authorId:message.author.id,signals}]);return {...r,signals};}
+}
+module.exports={ModerationService};

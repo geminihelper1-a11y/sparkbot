@@ -70,7 +70,7 @@ class NethrionDB {
       CREATE TABLE IF NOT EXISTS backups(id INTEGER PRIMARY KEY AUTOINCREMENT,guild_id TEXT NOT NULL,path TEXT NOT NULL,manifest_json TEXT NOT NULL,created_at TEXT NOT NULL,checksum TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS audit_events(id INTEGER PRIMARY KEY AUTOINCREMENT,guild_id TEXT NOT NULL,action_id TEXT NOT NULL,actor_id TEXT,request TEXT,resolved_intent TEXT,tool_name TEXT,target_json TEXT NOT NULL DEFAULT '{}',permission_json TEXT NOT NULL DEFAULT '{}',result_state TEXT NOT NULL,error_code TEXT,timestamp TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS idx_audit_guild ON audit_events(guild_id,timestamp);
-      CREATE TABLE IF NOT EXISTS security_incidents(id INTEGER PRIMARY KEY AUTOINCREMENT,guild_id TEXT NOT NULL,incident_key TEXT NOT NULL,severity TEXT NOT NULL,status TEXT NOT NULL,evidence_json TEXT NOT NULL DEFAULT '[]',first_seen_at TEXT NOT NULL,last_seen_at TEXT NOT NULL UNIQUE(guild_id,incident_key));
+      CREATE TABLE IF NOT EXISTS security_incidents(id INTEGER PRIMARY KEY AUTOINCREMENT,guild_id TEXT NOT NULL,incident_key TEXT NOT NULL,severity TEXT NOT NULL,status TEXT NOT NULL,evidence_json TEXT NOT NULL DEFAULT '[]',first_seen_at TEXT NOT NULL,last_seen_at TEXT NOT NULL, UNIQUE(guild_id,incident_key));
       CREATE TABLE IF NOT EXISTS ai_usage(id INTEGER PRIMARY KEY AUTOINCREMENT,guild_id TEXT,user_id TEXT,provider TEXT,model TEXT,tokens_in INTEGER,tokens_out INTEGER,created_at TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS idx_ai_usage ON ai_usage(guild_id,user_id,created_at);
       CREATE TABLE IF NOT EXISTS provider_health(provider TEXT PRIMARY KEY,status TEXT NOT NULL,last_error_code TEXT,consecutive_failures INTEGER NOT NULL DEFAULT 0,last_ok_at TEXT,last_checked_at TEXT);
